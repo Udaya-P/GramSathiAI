@@ -6,21 +6,24 @@ import ui
 
 def render():
     ui.show_flash()
-    _, col, _ = st.columns([1, 1.4, 1])
+    _, col, _ = st.columns([1, 1.5, 1])
     with col:
-        st.title("🌾 GramSathi AI")
-        st.write("Multilingual Gram Sabha meeting assistant — turn village discussions in Hindi, Telugu, "
-                 "Kannada and English into evidence-linked minutes.")
-        login_tab, register_tab = st.tabs(["Log in", "Register"])
+        st.markdown('<div class="gs-brand" style="margin-top:2rem"><div class="gs-brand-mark">G</div><div>'
+                    '<div class="gs-brand-name">GramSathi AI</div>'
+                    '<div class="gs-brand-sub">Gram Sabha meeting assistant</div></div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="gs-title">Meeting minutes, made clear</div>'
+                    '<div class="gs-subtitle">Record Gram Sabha discussions in Hindi, Telugu, Kannada or English, '
+                    'review what was said, and confirm the final minutes.</div>', unsafe_allow_html=True)
 
+        login_tab, register_tab = st.tabs(["Log in", "Create account"])
         with login_tab:
             with st.form("login_form"):
-                email = st.text_input("Email")
+                email = st.text_input("Email address", placeholder="name@example.com")
                 password = st.text_input("Password", type="password")
                 submitted = st.form_submit_button("Log in", type="primary", width="stretch")
             if submitted:
                 if not email or not password:
-                    st.error("Enter your email and password.")
+                    st.error("Enter your email address and password.")
                 else:
                     try:
                         with st.spinner("Logging in…"):
@@ -33,17 +36,20 @@ def render():
 
         with register_tab:
             with st.form("register_form"):
-                name = st.text_input("Full name")
-                email = st.text_input("Email", key="reg_email")
-                password = st.text_input("Password (12–128 characters)", type="password", key="reg_password")
-                submitted = st.form_submit_button("Create account", width="stretch")
+                name = st.text_input("Full name", placeholder="e.g. Lakshmi Devi")
+                email = st.text_input("Email address", key="reg_email", placeholder="name@example.com")
+                password = st.text_input("Password", type="password", key="reg_password",
+                                         help="Use at least 12 characters.")
+                submitted = st.form_submit_button("Create account", type="primary", width="stretch")
             if submitted:
-                if len(password) < 12:
-                    st.error("Password must be at least 12 characters.")
+                if not name.strip() or not email.strip():
+                    st.error("Enter your name and email address.")
+                elif len(password) < 12:
+                    st.error("Your password needs at least 12 characters.")
                 else:
                     try:
-                        with st.spinner("Creating account…"):
+                        with st.spinner("Creating your account…"):
                             api.register(name.strip(), email.strip(), password)
-                        st.success("Account created. Switch to the Log in tab to sign in.")
+                        st.success("Account created. Open the Log in tab to sign in.")
                     except api.ApiError as exc:
                         st.error(exc.message)

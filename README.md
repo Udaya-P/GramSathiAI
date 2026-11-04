@@ -132,7 +132,9 @@ The frontend lives in `frontend/` and talks to FastAPI only over HTTP (it never 
 ```bash
 pip install -r frontend/requirements.txt
 cp frontend/.env.example frontend/.env   # set API_BASE_URL to your FastAPI URL
-streamlit run frontend/app.py
+streamlit run frontend/app.py            # run from the repo root so .streamlit/config.toml (theme) is used
 ```
 
-Screens: login/register, meeting dashboard, create meeting, and a meeting workspace (Overview, Transcript with M4A upload and job status, Minutes with evidence, Verification). Audio jobs only progress while the backend worker is running. "Generate draft minutes" shows a notice until the Evon endpoint stops returning 501. Verification is prototype confirmation, not government approval.
+Pages: Dashboard, All Meetings, Create New Meeting, Audio & Transcripts (M4A upload, job status, transcript), Meeting Minutes (read and edit, suggestion vs approved resolution, evidence), and Verification (prototype human confirmation, not government approval). Shared styling is in `frontend/styles.py` and reusable pieces in `frontend/components.py`.
+
+Not available yet because the backend has no API for them: editing or deleting existing transcript segments, Timbre voice playback (the player is shown disabled), PDF export, and AI-drafted minutes (the Evon endpoint returns 501). Audio jobs only progress while the backend worker is running. Sessions are kept in memory, so a browser refresh requires logging in again.

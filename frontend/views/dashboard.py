@@ -1,40 +1,53 @@
+from html import escape
+
 import streamlit as st
 
 import api_client as api
+import components as c
 import ui
 
 
 def render():
-    head, action = st.columns([4, 1])
-    head.header("My Gram Sabha meetings")
-    if action.button("➕ New meeting", type="primary", width="stretch"):
-        ui.goto("create")
+    token = st.session_state.token
+    first = st.session_state.user["name"].split()[0]
+    head, action = st.columns([2, 1.2], vertical_alignment="bottom")
+    with head:
+        c.page_header(f"Welcome, {first}", "Here is where your Gram Sabha meetings stand.", eyebrow="Dashboard")
+    with action:
+        if st.button("Create New Meeting", type="primary", width="stretch", icon=":material/add:"):
+            ui.go("create")
 
     try:
-        with st.spinner("Loading meetings…"):
-            meetings = api.list_meetings(st.session_state.token)
+        with st.spinner("Loading your meetings…"):
+            meetings = api.list_meetings(token)
+            statuses = ui.minutes_statuses(token, meetings)
     except api.ApiError as exc:
         ui.handle_error(exc)
         return
 
+    counts = list(statuses.values())
+    cols = st.columns(4)
+    with cols[0]:
+        c.stat_card("Total meetings", len(meetings), "All meetings you created")
+    with cols[1]:
+        c.stat_card("No minutes yet", counts.count("none"), "Waiting for minutes")
+    with cols[2]:
+        c.stat_card("Awaiting review", counts.count("draft"), "Draft minutes to check", tone="amber")
+    with cols[3]:
+        c.stat_card("Verified minutes", counts.count("verified"), "Confirmed by a person", tone="green")
+
+    st.markdown("### Recent meetings")
     if not meetings:
-        st.info("You have no meetings yet. Create your first meeting to get started.")
+        c.empty_state("No meetings yet", "Create your first meeting to start adding recordings and minutes.")
         return
 
-    search = st.text_input("Search by title, village or district", placeholder="Search…")
-    if search:
-        q = search.lower()
-        meetings = [m for m in meetings
-                    if q in " ".join([m["title"], m["village_name"], m["district"]]).lower()]
-        if not meetings:
-            st.warning("No meetings match your search.")
-            return
-
-    cols = st.columns(3)
-    for i, m in enumerate(meetings):
-        with cols[i % 3].container(border=True):
-            st.subheader(m["title"])
-            st.caption(f"📍 {m['village_name']}, {m['district']}, {m['state']}")
-            st.write(f"📅 {m['meeting_date']}  ·  🗣️ {ui.LANGUAGES[m['primary_language']]}")
-            if st.button("Open meeting", key=f"open_{m['id']}", width="stretch"):
-                ui.goto("meeting", m["id"])
+    for m in sorted(meetings, key=lambda x: x["created_at"], reverse=True)[:5]:
+        with st.container(border=True):
+            info, status, btn = st.columns([4, 2, 1.3], vertical_alignment="center")
+            info.markdown(f'<div class="gs-meeting-title">{escape(m["title"])}</div>'
+                          f'<div class="gs-meeting-meta">{escape(m["village_name"])}, {escape(m["district"])} · '
+                          f'{ui.fmt_date(m["meeting_date"])} · {escape(ui.LANGUAGES[m["primary_language"]])}</div>',
+                          unsafe_allow_html=True)
+            status.markdown(c.status_chip(statuses.get(m["id"], "unknown")), unsafe_allow_html=True)
+            if btn.button("Open", key=f"open_{m['id']}", width="stretch"):
+                ui.go("minutes", m["id"])
