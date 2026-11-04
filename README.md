@@ -124,3 +124,15 @@ Deleting a meeting cascades its local jobs, raw results and segments. It does no
 **POST `/api/v1/meetings/{meeting_id}/minutes/generate`** is an authenticated extension point and returns **501** after a transcript exists. No real or simulated AI-generated content is returned. Official Evon documentation is still needed for its endpoint/base URL, authentication, model, request/response schema, evidence/citation format, limits and job lifecycle. No Evon endpoint was guessed.
 
 `MockEvonAdapter` accepts an explicit test fixture; it is only injected by tests. All generated entries require nonempty stable segment citations. Missing/foreign IDs are rejected with 422 and unsupported-evidence flags, without saving. Valid references establish provenance, not semantic support: every generated decision, action and issue carries `claim_support_unverified` in persisted `review_flags` until human confirmation. The existing manual minutes API remains available; no automated entailment check is claimed.
+
+## Streamlit frontend
+
+The frontend lives in `frontend/` and talks to FastAPI only over HTTP (it never touches the database or Gnani).
+
+```bash
+pip install -r frontend/requirements.txt
+cp frontend/.env.example frontend/.env   # set API_BASE_URL to your FastAPI URL
+streamlit run frontend/app.py
+```
+
+Screens: login/register, meeting dashboard, create meeting, and a meeting workspace (Overview, Transcript with M4A upload and job status, Minutes with evidence, Verification). Audio jobs only progress while the backend worker is running. "Generate draft minutes" shows a notice until the Evon endpoint stops returning 501. Verification is prototype confirmation, not government approval.
