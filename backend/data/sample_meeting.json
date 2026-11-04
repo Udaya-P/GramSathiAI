@@ -1,0 +1,111 @@
+{
+  "synthetic": true,
+  "label": "Synthetic Gram Sabha demonstration; fictional discussion, not an official record.",
+  "meeting": {
+    "title": "Village water supply and pipeline repair (synthetic)",
+    "village_name": "Kalpanapur (fictional)",
+    "district": "Demonstration District",
+    "state": "Demonstration State",
+    "meeting_date": "2026-10-15",
+    "primary_language": "te",
+    "supported_languages": [
+      "te",
+      "hi",
+      "kn",
+      "en"
+    ],
+    "description": "Synthetic multilingual Gram Sabha sample."
+  },
+  "transcript": {
+    "segments": [
+      {
+        "speaker_id": "speaker_1",
+        "language": "te",
+        "text": "మన గ్రామంలో మూడు రోజులుగా నీటి సరఫరా సరిగా లేదు.",
+        "start_time": 0,
+        "end_time": 6.5
+      },
+      {
+        "speaker_id": "speaker_2",
+        "language": "hi",
+        "text": "स्कूल के पास पाइपलाइन में रिसाव है। पहले उसकी जाँच होनी चाहिए।",
+        "start_time": 7,
+        "end_time": 14
+      },
+      {
+        "speaker_id": "speaker_3",
+        "language": "kn",
+        "text": "ನೀರಿನ ಸೋರಿಕೆಯಿಂದ ಮುಖ್ಯ ರಸ್ತೆಯಲ್ಲಿ ನೀರು ನಿಂತಿದೆ.",
+        "start_time": 14.5,
+        "end_time": 21
+      },
+      {
+        "speaker_id": "speaker_4",
+        "language": "en",
+        "text": "We should inspect the damaged pipeline tomorrow and obtain a repair estimate.",
+        "start_time": 22,
+        "end_time": 30
+      },
+      {
+        "speaker_id": "speaker_1",
+        "language": "te",
+        "text": "పైప్‌లైన్ మరమ్మతు ప్రతిపాదనను ఆమోదిద్దాం.",
+        "start_time": 31,
+        "end_time": 37
+      },
+      {
+        "speaker_id": "speaker_2",
+        "language": "hi",
+        "text": "पंचायत सचिव कल निरीक्षण की व्यवस्था करेंगे।",
+        "start_time": 38,
+        "end_time": 44
+      },
+      {
+        "speaker_id": "speaker_3",
+        "language": "kn",
+        "text": "ದುರಸ್ತಿಗೆ ಬೇಕಾದ ಹಣ ಇನ್ನೂ ಖಚಿತವಾಗಿಲ್ಲ.",
+        "start_time": 45,
+        "end_time": 51
+      },
+      {
+        "speaker_id": "speaker_4",
+        "language": "mixed",
+        "text": "Repair estimate సిద్ధమైన తర్వాత ఖర్చు గురించి చర్చిద్దాం.",
+        "start_time": 52,
+        "end_time": 59
+      }
+    ]
+  },
+  "minutes_template": {
+    "summary": "Residents discussed water supply interruptions, a pipeline leak and repair planning.",
+    "decisions": [
+      {
+        "description": "Approve pipeline repair planning",
+        "status": "approved",
+        "evidence_segment_ids": [
+          5
+        ]
+      }
+    ],
+    "action_items": [
+      {
+        "task": "Arrange a pipeline inspection",
+        "assigned_to": "Panchayat Secretary",
+        "deadline": "2026-10-16",
+        "evidence_segment_ids": [
+          4,
+          6
+        ]
+      }
+    ],
+    "unresolved_issues": [
+      {
+        "description": "Repair funding remains unconfirmed",
+        "evidence_segment_ids": [
+          7
+        ]
+      }
+    ]
+  },
+  "usage": "POST meeting to /api/v1/meetings, then transcript to its /transcript endpoint. Before POSTing minutes_template to /minutes, replace its illustrative 1-based evidence IDs with actual IDs returned for those segments. Do not POST the entire wrapper."
+}

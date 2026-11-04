@@ -1,0 +1,13 @@
+fastapi>=0.121,<1
+pydantic[email]>=2.10,<3
+SQLAlchemy>=2.0.36,<2.1
+alembic>=1.14,<2
+psycopg[binary]>=3.2,<4
+uvicorn>=0.32,<1
+python-dotenv>=1,<2
+pwdlib[argon2]>=0.2,<1
+PyJWT>=2.10,<3
+pytest>=8,<10
+httpx>=0.28,<1
+gnani-vachana==0.9.0
+python-multipart>=0.0.20,<1
