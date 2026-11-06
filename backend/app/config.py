@@ -19,6 +19,8 @@ class Settings(BaseModel):
     access_token_minutes: int = Field(default=30, ge=1, le=60)
     cors_origins: list[str] = Field(default_factory=list)
     gnani_api_key: SecretStr | None = None
+    app_environment: Literal["development", "test", "production"] = "production"
+    enable_mock_reasoning: bool = False
 
     @field_validator("database_url")
     @classmethod
@@ -57,4 +59,6 @@ def get_settings() -> Settings:
         access_token_minutes=os.getenv("ACCESS_TOKEN_MINUTES", "30"),
         cors_origins=json.loads(os.getenv("CORS_ORIGINS", "[]")),
         gnani_api_key=os.getenv("GNANI_API_KEY") or None,
+        app_environment=os.getenv("APP_ENVIRONMENT", "production"),
+        enable_mock_reasoning=os.getenv("ENABLE_MOCK_REASONING", "false"),
     )

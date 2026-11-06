@@ -9,11 +9,12 @@ backend/
   app/
     main.py, config.py, database.py, models.py, schemas.py, security.py
     routes/auth.py, routes/meetings.py
-    services/meeting_service.py
+    services/meeting_service.py, integrity.py, evon.py, prisma.py, transcription_service.py
+    worker.py
   alembic/env.py, alembic/script.py.mako, alembic/versions/0001_initial.py
   tests/test_backend.py
   data/sample_meeting.json
-  alembic.ini, requirements.txt, .env.example
+  alembic.ini, requirements.txt
 ```
 
 ## Setup and run
@@ -24,7 +25,7 @@ From the repository root:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r backend/requirements.txt
-cp backend/.env.example backend/.env
+# Create backend/.env if missing; configure the keys described below.
 python -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
@@ -71,7 +72,7 @@ For future schema changes: `alembic revision --autogenerate -m "describe change"
 
 ## Scope
 
-Manual transcript/minutes APIs remain compatible. Recorded meetings now support queued Prisma v3.0 Batch transcription. No frontend, translation, voice output or PDF export is implemented. Evon reasoning remains disabled until its official API contract is available. Keep Gnani credentials exclusively on the backend.
+Manual transcript/minutes APIs remain compatible. Recorded meetings now support queued Prisma v3.0 Batch transcription. No frontend, translation, voice output or PDF export is implemented. The Phase 3 pipeline works with explicit development fixtures; live Evon reasoning remains disabled until its official API contract is available. Keep Gnani credentials exclusively on the backend.
 
 
 ## Prisma v3.0 Batch transcription
@@ -119,8 +120,65 @@ There is no documented idempotency guarantee for a provider create request. The 
 
 Deleting a meeting cascades its local jobs, raw results and segments. It does not cancel an already submitted provider job; provider-side retention/cancellation is a separate operation.
 
-## Evon adapter status
+## Phase 3: evidence-grounded meeting intelligence
 
-**POST `/api/v1/meetings/{meeting_id}/minutes/generate`** is an authenticated extension point and returns **501** after a transcript exists. No real or simulated AI-generated content is returned. Official Evon documentation is still needed for its endpoint/base URL, authentication, model, request/response schema, evidence/citation format, limits and job lifecycle. No Evon endpoint was guessed.
+The default **POST `/api/v1/meetings/{meeting_id}/minutes/generate`** still returns **501** for live Evon. A provider-independent `ReasoningProvider` consumes persisted segments and returns an untrusted structured candidate. No other commercial LLM replaces Evon. `MockEvonAdapter` deterministically returns a caller-supplied fixture; it does **not** extract facts or simulate a real model.
 
-`MockEvonAdapter` accepts an explicit test fixture; it is only injected by tests. All generated entries require nonempty stable segment citations. Missing/foreign IDs are rejected with 422 and unsupported-evidence flags, without saving. Valid references establish provenance, not semantic support: every generated decision, action and issue carries `claim_support_unverified` in persisted `review_flags` until human confirmation. The existing manual minutes API remains available; no automated entailment check is claimed.
+Apply migration **`0003`** with `alembic upgrade head`. It adds optional amount/classification/deadline/quote fields, summary citations, and versioned draft/review history. Existing transcript/job tables and IDs are untouched. Verified legacy minutes remain verified. Before deploying to Neon, test the migration on an isolated branch and run Alembic using its direct (non-pooled) connection; the changes here were tested on disposable local PostgreSQL.
+
+For development fixture mode only, set these in `backend/.env`, then restart Uvicorn:
+
+```dotenv
+APP_ENVIRONMENT=development
+ENABLE_MOCK_REASONING=true
+```
+
+Defaults are `production` and `false`. Even with the flag enabled, production rejects mock requests with 403. No Gnani key or transcription worker is needed for this pipeline. Keep existing `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGINS` and optional `GNANI_API_KEY` settings; never share their values. If creating a fresh `.env`, those first two keys are required.
+
+### Swagger: generate, inspect, correct, review
+
+1. Open `/docs`, log in and **Authorize**. Use the UUID of your meeting with persisted transcript data. **GET `/api/v1/meetings/{meeting_id}/transcript`** gives the real integer IDs and original evidence. Do not add synthetic segments to the real recording.
+2. In **POST `/api/v1/meetings/{meeting_id}/minutes/generate`**, select **Try it out**. Set `provider` to `mock` and supply `fixture` matching the minutes schema. Copy actual IDs from step 1. The template below uses **E, P, A, C as placeholders**, not fabricated IDs: replace them with the persisted estimate, proposal, approval and coordination/progress-update segment IDs. They may be the same ID if several statements share a segment. Quote the relevant original excerpts through optional `evidence_quotes` when needed.
+
+   ```text
+   {
+     "provider": "mock",
+     "fixture": {
+       "summary": "Pipeline repair has a ₹17,000 estimate and a ₹15,000 approved allocation. Coordination and a progress update are required.",
+       "summary_evidence_segment_ids": [E, P, A, C],
+       "decisions": [{
+         "description": "Allocate funds for pipeline repair",
+         "status": "APPROVED",
+         "estimated_amount": 17000,
+         "proposed_amount": 15000,
+         "approved_amount": 15000,
+         "currency": "INR",
+         "evidence_segment_ids": [E, P, A]
+       }],
+       "action_items": [
+         {"task": "Coordinate pipeline repair", "assigned_to": "Panchayat Secretary", "deadline": null, "evidence_segment_ids": [C]},
+         {"task": "Provide progress update", "assigned_to": null, "deadline": null, "deadline_text": "within seven days", "evidence_segment_ids": [C]}
+       ],
+       "unresolved_issues": []
+     }
+   }
+   ```
+
+   This is Meeting 1's **expected fixture interpretation**, not live extraction. Attribute the progress update to a person only if its actual evidence assigns that responsibility. No calendar deadline is inferred. Money is serialized as decimal strings. Inspect and correct the fixture against the transcript; do not trust it merely because it matches this example.
+3. The response must say `status=draft`, `generation_source=mock_fixture`. Read **GET `/minutes`**, **GET `/decisions`**, **GET `/action-items`**, **GET `/minutes/integrity`**, and **GET `/minutes/evidence`** under the same meeting prefix. Evidence includes untouched text, start/end times, language and actual speaker IDs. No extra speakers or dialogue roles are fabricated.
+4. To correct a draft, **POST `/minutes`** using the editable request fields, actual evidence IDs and `expected_revision` from the latest GET. Change amounts, statuses, `assigned_to`, `deadline_text` or `deadline` as needed. Do not copy response-only fields such as document `status`, `revision`, history or verification metadata into this request. Warnings are recalculated, and the original generated draft remains preserved.
+5. To reject, **POST `/minutes/review`** with `{"decision":"reject","reviewer_name":"Secretary","expected_revision":R,"comment":"Correct the allocation."}` (replace R with the current revision). It remains a draft with `review_state=rejected`; edit/regenerate before approval.
+6. To approve, **POST `/minutes/verify`** with `{"verifier_name":"Secretary","confirmed":true,"acknowledge_warnings":true,"expected_revision":R}`. Alternatively `/minutes/review` accepts `decision=approve`, `reviewer_name`, `confirmed=true`, warning acknowledgement and the revision. Generated drafts require explicit warning acknowledgement. Stale revisions, unauthorized reviewers and repeated verification are rejected. This is prototype owner confirmation, not government approval.
+7. **GET `/minutes/history`** returns the immutable first generated snapshot plus ordered generation, edit, rejection and approval snapshots, reviewer metadata, warnings and evidence. Verification acknowledges warnings rather than deleting them. Legacy manually authored requests remain valid; new fields are optional. Verified documents stay immutable.
+
+### Integrity checks and limits
+
+Missing/foreign citations, empty evidence on material claims, or non-exact quoted evidence fail with 422 and save nothing. Generated summaries also need `summary_evidence_segment_ids` or cited `summary_claims` (`text`, `evidence_segment_ids`, optional quotes). Prose claims cannot be supplied as evidence for themselves.
+
+Narrow deterministic checks compare amounts/currencies with cited clauses and distinguish estimates, proposals and explicit approval, including negation/conditional guards. They check assignment/commitment wording, relative-deadline scope, calendar-date support, contradictory budgets/statuses, and quotes against their surrounding context. **Segment-ID validity is not treated as semantic proof.** `APPROVED`, `PROPOSED`, `REJECTED`, `DEFERRED`, `UNCLEAR` are accepted case-insensitively. Existing lowercase `status` values remain compatible; deferred/unclear map to legacy `proposed` with the precise new `classification` preserved. Unknown amounts, assignees and deadlines stay null.
+
+Warnings include `UNSUPPORTED_APPROVAL`, `UNSUPPORTED_REJECTION`, `UNSUPPORTED_BUDGET`, `CONFLICTING_AMOUNTS`, `UNSUPPORTED_DEADLINE`, `UNSUPPORTED_ASSIGNEE`, `INVALID_EVIDENCE_REFERENCE`, `AMBIGUOUS_DECISION_STATUS`, `INSUFFICIENT_EVIDENCE` and `CLAIM_SUPPORT_UNVERIFIED`. Each identifies the affected claim, explanation, evidence IDs, severity and human-review requirement. Questionable output is retained only as a flagged draft; invalid references never persist.
+
+The checker is intentionally conservative: currency matching covers INR/USD/EUR, and lexical/number rules cover common English forms plus a limited set of native-script forms. It does not provide comprehensive multilingual semantic entailment, translation or reliable coreference. Original Telugu, Kannada, Hindi and code-mixed evidence survives intact; uncertain wording is flagged for human review. A suggested deadline is not automatically a commitment; seven days for an update is not seven days to complete the repair. Even a matching claim retains `CLAIM_SUPPORT_UNVERIFIED`. Review flags are aids, not an automated correctness certificate.
+
+To activate live Evon, supply its **official endpoint/base URL, authentication, model identifier, request/response and citation schemas, limits, timeout/retry policy and sync/async job lifecycle**. Only the provider adapter should change; grounding, storage, audit history and owner review stay shared. No live Evon support is claimed.

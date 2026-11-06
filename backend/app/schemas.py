@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -105,26 +106,75 @@ class SegmentOut(SegmentCreate):
     provider_speaker_id: int | None = None
 
 
+class EvidenceQuote(Schema):
+    segment_id: Annotated[int, Field(strict=True, gt=0)]
+    quote: Nonblank
+
+
+Money = Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=2, allow_inf_nan=False)]
+Classification = Literal["approved", "proposed", "rejected", "deferred", "unclear"]
+
+
 class DecisionCreate(Schema):
     description: Nonblank
     status: Literal["proposed", "approved", "rejected"]
+    classification: Classification | None = None
+    estimated_amount: Money | None = None
+    proposed_amount: Money | None = None
+    approved_amount: Money | None = None
+    currency: Literal["INR", "USD", "EUR"] | None = None
     evidence_segment_ids: Evidence
+    evidence_quotes: list[EvidenceQuote] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def map_status(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            raw = value.get("status")
+            if isinstance(raw, str):
+                raw = raw.lower()
+                value["status"] = "proposed" if raw in {"deferred", "unclear"} else raw
+                value.setdefault("classification", raw)
+            if isinstance(value.get("classification"), str):
+                value["classification"] = value["classification"].lower()
+        return value
+
+    @model_validator(mode="after")
+    def consistent_status(self):
+        self.classification = self.classification or self.status
+        expected = "proposed" if self.classification in {"deferred", "unclear"} else self.classification
+        if self.status != expected:
+            raise ValueError("classification must agree with the legacy status")
+        return self
 
 
 class ActionCreate(Schema):
     task: Nonblank
-    assigned_to: ShortText
+    assigned_to: ShortText | None = None
     deadline: date | None = None
+    deadline_text: ShortText | None = None
     evidence_segment_ids: Evidence
+    evidence_quotes: list[EvidenceQuote] = Field(default_factory=list, max_length=1000)
 
 
 class IssueCreate(Schema):
     description: Nonblank
     evidence_segment_ids: Evidence
+    evidence_quotes: list[EvidenceQuote] = Field(default_factory=list, max_length=1000)
+
+
+class SummaryClaim(Schema):
+    text: Nonblank
+    evidence_segment_ids: Evidence
+    evidence_quotes: list[EvidenceQuote] = Field(default_factory=list, max_length=1000)
 
 
 class MinutesCreate(Schema):
     summary: Nonblank
+    summary_evidence_segment_ids: list[Annotated[int, Field(strict=True, gt=0)]] = Field(default_factory=list, max_length=1000)
+    summary_claims: list[SummaryClaim] = Field(default_factory=list, max_length=1000)
+    expected_revision: Annotated[int, Field(ge=1)] | None = None
     decisions: Annotated[list[DecisionCreate], Field(max_length=1000)] = Field(default_factory=list)
     action_items: Annotated[list[ActionCreate], Field(max_length=1000)] = Field(default_factory=list)
     unresolved_issues: Annotated[list[IssueCreate], Field(max_length=1000)] = Field(default_factory=list)
@@ -138,12 +188,18 @@ class MinutesOut(MinutesCreate):
     verified_at: datetime | None
     created_at: datetime
     review_flags: list[dict] = Field(default_factory=list)
+    generation_source: str = "manual"
+    review_state: Literal["pending", "rejected", "accepted"] = "pending"
+    revision: int = 1
 
 
 class Verification(Schema):
     """Prototype user confirmation, not legally authenticated government approval."""
     verifier_name: ShortText
     confirmed: Literal[True]
+    acknowledge_warnings: bool = Field(default=False, strict=True)
+    expected_revision: Annotated[int, Field(ge=1)] | None = None
+    comment: Nonblank | None = None
 
     @field_validator("confirmed", mode="before")
     @classmethod
@@ -151,6 +207,26 @@ class Verification(Schema):
         if value is not True:
             raise ValueError("Explicit confirmed: true is required")
         return value
+
+
+class GenerateMinutes(Schema):
+    provider: Literal["evon", "mock"] = "evon"
+    fixture: MinutesCreate | None = None
+
+    @model_validator(mode="after")
+    def explicit_fixture(self):
+        if (self.provider == "mock") != (self.fixture is not None):
+            raise ValueError("Only mock mode accepts and requires a fixture")
+        return self
+
+
+class ReviewMinutes(Schema):
+    decision: Literal["approve", "reject"]
+    reviewer_name: ShortText
+    expected_revision: Annotated[int, Field(ge=1)]
+    confirmed: bool = Field(default=False, strict=True)
+    acknowledge_warnings: bool = Field(default=False, strict=True)
+    comment: Nonblank | None = None
 
 
 class TranscriptionJobOut(Schema):

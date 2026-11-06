@@ -1,7 +1,8 @@
 from datetime import date, datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint, func
+from sqlalchemy import CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -73,6 +74,13 @@ class MeetingMinutes(Base):
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     review_flags: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
+    summary_evidence_segment_ids: Mapped[list[int]] = mapped_column(JSONB, default=list, server_default="[]")
+    summary_claims: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
+    generation_source: Mapped[str] = mapped_column(String(20), default="manual", server_default="manual")
+    review_state: Mapped[str] = mapped_column(String(10), default="pending", server_default="pending")
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    generated_original: Mapped[dict | None] = mapped_column(JSONB)
+    history: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]", deferred=True)
     decisions: Mapped[list["Decision"]] = relationship(cascade="all, delete-orphan", passive_deletes=True, order_by="Decision.id")
     action_items: Mapped[list["ActionItem"]] = relationship(cascade="all, delete-orphan", passive_deletes=True, order_by="ActionItem.id")
     unresolved_issues: Mapped[list["UnresolvedIssue"]] = relationship(cascade="all, delete-orphan", passive_deletes=True, order_by="UnresolvedIssue.id")
@@ -85,7 +93,13 @@ class Decision(Base):
     minutes_id: Mapped[int] = mapped_column(ForeignKey("meeting_minutes.id", ondelete="CASCADE"), index=True)
     description: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(10))
+    classification: Mapped[str] = mapped_column(String(10), default="proposed", server_default="proposed")
+    estimated_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    proposed_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    approved_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    currency: Mapped[str | None] = mapped_column(String(3))
     evidence_segment_ids: Mapped[list[int]] = mapped_column(JSONB)
+    evidence_quotes: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
 
 
 class ActionItem(Base):
@@ -93,9 +107,11 @@ class ActionItem(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     minutes_id: Mapped[int] = mapped_column(ForeignKey("meeting_minutes.id", ondelete="CASCADE"), index=True)
     task: Mapped[str] = mapped_column(Text)
-    assigned_to: Mapped[str] = mapped_column(String(200))
+    assigned_to: Mapped[str | None] = mapped_column(String(200))
     deadline: Mapped[date | None] = mapped_column(Date)
+    deadline_text: Mapped[str | None] = mapped_column(String(200))
     evidence_segment_ids: Mapped[list[int]] = mapped_column(JSONB)
+    evidence_quotes: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
 
 
 class UnresolvedIssue(Base):
@@ -104,6 +120,7 @@ class UnresolvedIssue(Base):
     minutes_id: Mapped[int] = mapped_column(ForeignKey("meeting_minutes.id", ondelete="CASCADE"), index=True)
     description: Mapped[str] = mapped_column(Text)
     evidence_segment_ids: Mapped[list[int]] = mapped_column(JSONB)
+    evidence_quotes: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
 
 
 class TranscriptionJob(Base):

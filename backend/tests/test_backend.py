@@ -38,8 +38,8 @@ def api():
         pytest.fail("Test database name must differ from the application database name")
     if not app_url:
         pytest.fail("DATABASE_URL is required for the test database isolation safety check")
-    original_env = {key: os.environ.get(key) for key in ("DATABASE_URL", "JWT_SECRET", "CORS_ORIGINS")}
-    os.environ.update(DATABASE_URL=test_url, JWT_SECRET=secrets.token_urlsafe(48), CORS_ORIGINS="[]")
+    original_env = {key: os.environ.get(key) for key in ("DATABASE_URL", "JWT_SECRET", "CORS_ORIGINS", "APP_ENVIRONMENT", "ENABLE_MOCK_REASONING")}
+    os.environ.update(DATABASE_URL=test_url, JWT_SECRET=secrets.token_urlsafe(48), CORS_ORIGINS="[]", APP_ENVIRONMENT="test", ENABLE_MOCK_REASONING="true")
     from app.config import get_settings
     get_settings.cache_clear()
     from app.database import get_db, engine as app_engine
@@ -113,7 +113,7 @@ def segment(text_value="Pipeline inspection", start=0, end=4, language="en"):
 
 
 def minutes(segment_id):
-    return {"summary": "Water supply discussion", "decisions": [{"description": "Repair pipeline", "status": "approved", "evidence_segment_ids": [segment_id]}],
+    return {"summary": "Water supply discussion", "summary_evidence_segment_ids": [segment_id], "decisions": [{"description": "Repair pipeline", "status": "approved", "evidence_segment_ids": [segment_id]}],
             "action_items": [{"task": "Inspect pipeline", "assigned_to": "Secretary", "deadline": None, "evidence_segment_ids": [segment_id]}],
             "unresolved_issues": [{"description": "Funding pending", "evidence_segment_ids": [segment_id]}]}
 
@@ -229,6 +229,8 @@ def block_live_provider_calls(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("Live HTTP calls are forbidden in tests")
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
+    import httpx
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", forbidden)
 
 
 def queue_upload(api, owner, path, audio=None, code="en-IN,te-IN", filename="meeting.m4a"):
@@ -450,10 +452,10 @@ def test_evon_disabled_mock_citations_and_human_review(api):
         result = api.post(path + "/minutes/generate", headers=owner)
         assert result.status_code == 200, result.text
         draft = result.json()
-        assert draft["status"] == "draft" and len(draft["review_flags"]) == 3
-        assert all(f["code"] == "claim_support_unverified" for f in draft["review_flags"])
-        verified = api.post(path + "/minutes/verify", headers=owner, json={"confirmed": True, "verifier_name": "Secretary"})
-        assert verified.json()["status"] == "verified" and verified.json()["review_flags"] == []
+        assert draft["status"] == "draft" and draft["generation_source"] == "mock_fixture"
+        assert any(f["code"] == "CLAIM_SUPPORT_UNVERIFIED" for f in draft["review_flags"])
+        verified = api.post(path + "/minutes/verify", headers=owner, json={"confirmed": True, "verifier_name": "Secretary", "acknowledge_warnings": True})
+        assert verified.json()["status"] == "verified" and all(f["acknowledged"] for f in verified.json()["review_flags"])
         assert api.post(path + "/minutes/generate", headers=owner).status_code == 409
     finally:
         api.app.dependency_overrides.pop(get_evon_adapter, None)
@@ -480,3 +482,260 @@ def test_worker_recovers_lost_commit_acknowledgement(api, monkeypatch):
     worker_tick(api, client, job["id"])
     remote.start.assert_called_once()
     assert client.create_job.call_count == 1
+
+
+def phase3_fixture(api, owner):
+    """Synthetic Meeting 1 semantics, persisted before IDs are used as citations."""
+    path = meeting(api, owner)
+    texts = [
+        "మన గ్రామంలో నీటి సమస్య ఉంది. Estimated pipeline repair cost is approximately ₹17,000.",
+        "We propose an allocation of ₹15,000 for the pipeline repair.",
+        "The proposal is approved.",
+        "Panchayat Secretary must coordinate the repair and provide a progress update within seven days.",
+        "The additional borewell proposal is deferred pending a funding decision.",
+    ]
+    response = api.post(path + "/transcript", headers=owner, json={"segments": [
+        segment(text_value=text, start=index * 6, end=index * 6 + 5, language="mixed")
+        for index, text in enumerate(texts)]})
+    assert response.status_code == 201, response.text
+    saved = response.json()
+    ids = [s["id"] for s in saved]
+    fixture = {
+        "summary": "Village water supply needs pipeline repair, with a ₹17,000 estimate and a ₹15,000 approved allocation. Coordination and a progress update are required.",
+        "summary_evidence_segment_ids": ids[:4],
+        "summary_claims": [
+            {"text": "The repair estimate is ₹17,000.", "evidence_segment_ids": [ids[0]]},
+            {"text": "The proposal for ₹15,000 is approved.", "evidence_segment_ids": ids[1:3]},
+        ],
+        "decisions": [
+            {"description": "Allocate funds for pipeline repair", "status": "APPROVED", "estimated_amount": 17000,
+             "proposed_amount": 15000, "approved_amount": 15000, "currency": "INR", "evidence_segment_ids": ids[:3],
+             "evidence_quotes": [{"segment_id": ids[1], "quote": texts[1]}, {"segment_id": ids[2], "quote": texts[2]},
+                                 {"segment_id": ids[0], "quote": texts[0]}]},
+            {"description": "Additional borewell funding remains pending", "status": "DEFERRED", "evidence_segment_ids": [ids[4]]},
+        ],
+        "action_items": [
+            {"task": "Coordinate pipeline repair", "assigned_to": "Panchayat Secretary", "deadline": None, "evidence_segment_ids": [ids[3]]},
+            {"task": "Provide progress update", "assigned_to": "Panchayat Secretary", "deadline": None,
+             "deadline_text": "within seven days", "evidence_segment_ids": [ids[3]]},
+        ],
+        "unresolved_issues": [{"description": "Additional borewell funding is not yet decided", "evidence_segment_ids": [ids[4]]}],
+    }
+    return path, saved, fixture
+
+
+def generate_fixture(api, owner, path, fixture):
+    return api.post(path + "/minutes/generate", headers=owner, json={"provider": "mock", "fixture": fixture})
+
+
+def test_phase3_meeting_one_grounding_and_review_history(api):
+    from copy import deepcopy
+    from decimal import Decimal
+    owner, _, _ = account(api)
+    other, _, _ = account(api)
+    path, source, fixture = phase3_fixture(api, owner)
+    result = generate_fixture(api, owner, path, fixture)
+    assert result.status_code == 200, result.text
+    draft = result.json()
+    decision = draft["decisions"][0]
+    assert decision["status"] == decision["classification"] == "approved"
+    assert Decimal(decision["approved_amount"]) == 15000
+    assert Decimal(decision["estimated_amount"]) == 17000
+    assert draft["decisions"][1]["status"] == "proposed" and draft["decisions"][1]["classification"] == "deferred"
+    assert draft["action_items"][0]["deadline"] is None and draft["action_items"][0]["deadline_text"] is None
+    assert draft["action_items"][1]["deadline"] is None and draft["action_items"][1]["deadline_text"] == "within seven days"
+    assert not any(w["code"] in {"UNSUPPORTED_BUDGET", "UNSUPPORTED_APPROVAL", "UNSUPPORTED_ASSIGNEE", "UNSUPPORTED_DEADLINE", "CONFLICTING_AMOUNTS"} for w in draft["review_flags"])
+    assert draft["status"] == "draft" and draft["generation_source"] == "mock_fixture"
+    assert all(w["requires_human_review"] for w in draft["review_flags"])
+    evidence = api.get(path + "/minutes/evidence", headers=owner).json()
+    assert evidence["segments"] == source  # Original text, timestamps and speaker IDs survive.
+    assert len({s["speaker_id"] for s in evidence["segments"]}) == 1
+    for suffix in ("/decisions", "/action-items", "/minutes/evidence", "/minutes/integrity", "/minutes/history"):
+        assert api.get(path + suffix, headers=owner).status_code == 200
+        assert api.get(path + suffix, headers=other).status_code == 404
+    original = api.get(path + "/minutes/history", headers=owner).json()["generated_original"]
+    edit = deepcopy(fixture)
+    edit["expected_revision"] = draft["revision"]
+    edit["decisions"][0]["approved_amount"] = 14000
+    changed = api.post(path + "/minutes", headers=owner, json=edit)
+    assert changed.status_code == 200, changed.text
+    assert any(w["code"] == "UNSUPPORTED_BUDGET" for w in changed.json()["review_flags"])
+    rejection = {"decision": "reject", "reviewer_name": "Secretary", "expected_revision": changed.json()["revision"], "comment": "Correct the approved allocation."}
+    assert api.post(path + "/minutes/review", headers=other, json=rejection).status_code == 404
+    rejected = api.post(path + "/minutes/review", headers=owner, json=rejection)
+    assert rejected.status_code == 200 and rejected.json()["review_state"] == "rejected"
+    assert rejected.json()["status"] == "draft"
+    confirmation = {"confirmed": True, "verifier_name": "Secretary", "acknowledge_warnings": True}
+    assert api.post(path + "/minutes/verify", headers=owner, json=confirmation).status_code == 409
+    edit["decisions"][0]["approved_amount"] = 15000
+    edit["expected_revision"] = rejected.json()["revision"]
+    corrected = api.post(path + "/minutes", headers=owner, json=edit).json()
+    assert api.post(path + "/minutes", headers=owner, json=edit).status_code == 409  # stale revision
+    assert api.post(path + "/minutes/verify", headers=owner, json={"confirmed": True, "verifier_name": "Secretary"}).status_code == 409
+    assert api.post(path + "/minutes/verify", headers=other, json=confirmation).status_code == 404
+    review = {"decision": "approve", "reviewer_name": "Secretary", "expected_revision": corrected["revision"],
+              "confirmed": True, "acknowledge_warnings": True, "comment": "Reviewed original evidence."}
+    assert api.post(path + "/minutes/review", headers=owner, json={**review, "confirmed": False}).status_code == 422
+    verified = api.post(path + "/minutes/review", headers=owner, json=review)
+    assert verified.status_code == 200, verified.text
+    assert verified.json()["status"] == "verified" and verified.json()["review_state"] == "accepted"
+    history = api.get(path + "/minutes/history", headers=owner).json()
+    assert history["generated_original"] == original
+    assert history["history"][-1]["comment"] == "Reviewed original evidence."
+    assert [h["event"] for h in history["history"]] == ["generated", "manual_edit", "rejected", "manual_edit", "approved"]
+    assert any(Decimal(h["document"]["decisions"][0]["approved_amount"]) == 14000 for h in history["history"])
+    assert api.get(path + "/transcript", headers=owner).json() == source
+    assert generate_fixture(api, owner, path, fixture).status_code == 409
+
+
+@pytest.mark.parametrize("text,status,expected,absent", [
+    ("We propose an allocation of ₹15,000.", "PROPOSED", None, "UNSUPPORTED_APPROVAL"),
+    ("We propose an allocation of ₹15,000.", "APPROVED", "UNSUPPORTED_APPROVAL", None),
+    ("The budget of ₹15,000 is rejected.", "REJECTED", None, "UNSUPPORTED_REJECTION"),
+    ("The proposal of ₹15,000 is not approved.", "APPROVED", "UNSUPPORTED_APPROVAL", None),
+    ("Everyone agreed the repair would be useful. Should we approve ₹15,000?", "APPROVED", "UNSUPPORTED_APPROVAL", None),
+    ("The proposal of ₹15,000 is not rejected; it remains pending.", "REJECTED", "UNSUPPORTED_REJECTION", None),
+    ("The proposal of ₹15,000 is unclear.", "UNCLEAR", "AMBIGUOUS_DECISION_STATUS", None),
+])
+def test_phase3_status_distinctions(api, text, status, expected, absent):
+    owner, _, _ = account(api)
+    path = meeting(api, owner)
+    sid = api.post(path + "/transcript", headers=owner, json={"segments": [segment(text_value=text)]}).json()[0]["id"]
+    fixture = {"summary": "Budget discussion.", "summary_evidence_segment_ids": [sid],
+               "decisions": [{"description": "Budget allocation", "status": status, "evidence_segment_ids": [sid]}]}
+    response = generate_fixture(api, owner, path, fixture)
+    assert response.status_code == 200, response.text
+    codes = {w["code"] for w in response.json()["review_flags"]}
+    if expected:
+        assert expected in codes
+    if absent:
+        assert absent not in codes
+    assert response.json()["status"] == "draft"
+    assert response.json()["decisions"][0]["approved_amount"] is None
+
+
+def test_phase3_unsupported_budget_assignee_and_deadline(api):
+    owner, _, _ = account(api)
+    path, _, fixture = phase3_fixture(api, owner)
+    fixture["decisions"][0]["approved_amount"] = 17000  # Estimate is not the allocation.
+    fixture["action_items"][0].update(deadline="2026-10-22", deadline_text="within seven days", assigned_to="Village Engineer")
+    fixture["action_items"][1]["assigned_to"] = None
+    response = generate_fixture(api, owner, path, fixture)
+    assert response.status_code == 200, response.text
+    flags = response.json()["review_flags"]
+    assert {"UNSUPPORTED_BUDGET", "CONFLICTING_AMOUNTS", "UNSUPPORTED_ASSIGNEE", "UNSUPPORTED_DEADLINE", "INSUFFICIENT_EVIDENCE"}.issubset({w["code"] for w in flags})
+    assert response.json()["action_items"][1]["assigned_to"] is None
+    assert any(w["entity"] == "action_items[0]" and w["code"] == "UNSUPPORTED_DEADLINE" for w in flags)
+    assert all({"code", "entity", "explanation", "evidence_segment_ids", "requires_human_review"} <= w.keys() for w in flags)
+
+
+def test_phase3_invalid_cross_meeting_and_empty_evidence(api):
+    from copy import deepcopy
+    owner, _, _ = account(api)
+    path, _, fixture = phase3_fixture(api, owner)
+    other_path = meeting(api, owner)
+    foreign_id = api.post(other_path + "/transcript", headers=owner, json={"segments": [segment()]}).json()[0]["id"]
+    for bad_id in (foreign_id, 2147483647):
+        invalid = deepcopy(fixture)
+        invalid["decisions"][0]["evidence_segment_ids"] = [bad_id]
+        response = generate_fixture(api, owner, path, invalid)
+        assert response.status_code == 422, response.text
+        assert any(w["code"] == "INVALID_EVIDENCE_REFERENCE" for w in response.json()["detail"]["review_flags"])
+        assert api.get(path + "/minutes", headers=owner).status_code == 404
+    invalid = deepcopy(fixture)
+    invalid["action_items"][0]["evidence_segment_ids"] = []
+    assert generate_fixture(api, owner, path, invalid).status_code == 422
+    invalid = deepcopy(fixture)
+    invalid["summary_evidence_segment_ids"] = []
+    invalid["summary_claims"] = []
+    response = generate_fixture(api, owner, path, invalid)
+    assert response.status_code == 422
+    assert any(w["entity"] == "summary" and w["code"] == "INSUFFICIENT_EVIDENCE" for w in response.json()["detail"]["review_flags"])
+    invalid = deepcopy(fixture)
+    invalid["decisions"][0]["evidence_quotes"][0]["quote"] = "The budget is ₹99,999 and approved."
+    response = generate_fixture(api, owner, path, invalid)
+    assert response.status_code == 422
+    assert any(w["code"] == "INSUFFICIENT_EVIDENCE" for w in response.json()["detail"]["review_flags"])
+
+
+def test_phase3_conflicts_and_native_evidence_remain_reviewable(api):
+    owner, _, _ = account(api)
+    path = meeting(api, owner)
+    texts = ["ప్రతిపాదనను చర్చిద్దాం. ₹15,000 అవసరం. ಅಂದಾಜು ವೆಚ್ಚವನ್ನು ಪರಿಶೀಲಿಸೋಣ. प्रस्ताव पर चर्चा लंबित है।",
+             "The budget of ₹15,000 is approved. The budget of ₹17,000 is rejected."]
+    source = api.post(path + "/transcript", headers=owner, json={"segments": [segment(text_value=t, start=i*5, end=i*5+4, language="mixed") for i,t in enumerate(texts)]}).json()
+    ids = [s["id"] for s in source]
+    fixture = {"summary": texts[0], "summary_evidence_segment_ids": ids,
+               "decisions": [{"description": "Allocation", "status": "approved", "approved_amount": 15000, "currency": "INR", "evidence_segment_ids": [ids[1]]},
+                             {"description": "Allocation", "status": "rejected", "approved_amount": 17000, "currency": "INR", "evidence_segment_ids": [ids[1]]}]}
+    result = generate_fixture(api, owner, path, fixture)
+    assert result.status_code == 200, result.text
+    assert {"CONFLICTING_AMOUNTS", "AMBIGUOUS_DECISION_STATUS"} <= {w["code"] for w in result.json()["review_flags"]}
+    assert result.json()["summary"] == texts[0]
+    assert api.get(path + "/minutes/evidence", headers=owner).json()["segments"] == source
+
+
+def test_phase3_mock_gate_and_live_evon_stays_disabled(api, monkeypatch):
+    from app.config import get_settings
+    owner, _, _ = account(api)
+    path, _, fixture = phase3_fixture(api, owner)
+    assert api.post(path + "/minutes/generate", headers=owner).status_code == 501
+    assert api.post(path + "/minutes/generate", headers=owner, json={"provider": "evon"}).status_code == 501
+    monkeypatch.setattr(get_settings(), "app_environment", "production")
+    assert generate_fixture(api, owner, path, fixture).status_code == 403
+    monkeypatch.setattr(get_settings(), "app_environment", "development")
+    monkeypatch.setattr(get_settings(), "enable_mock_reasoning", False)
+    assert generate_fixture(api, owner, path, fixture).status_code == 403
+    assert api.get(path + "/minutes", headers=owner).status_code == 404
+
+
+def test_phase3_quotes_cannot_hide_condition_or_reverse_chronology(api):
+    owner, _, _ = account(api)
+    path = meeting(api, owner)
+    text_value = "We propose an allocation of ₹15,000. If the proposal is approved, we can proceed."
+    sid = api.post(path + "/transcript", headers=owner, json={"segments": [segment(text_value=text_value)]}).json()[0]["id"]
+    fixture = {"summary": "Allocation discussion.", "summary_evidence_segment_ids": [sid], "decisions": [
+        {"description": "Pipeline allocation", "status": "approved", "approved_amount": 15000, "currency": "INR", "evidence_segment_ids": [sid],
+         "evidence_quotes": [{"segment_id": sid, "quote": "the proposal is approved"},
+                             {"segment_id": sid, "quote": "We propose an allocation of ₹15,000."}]}]}
+    response = generate_fixture(api, owner, path, fixture)
+    assert response.status_code == 200, response.text
+    assert {"UNSUPPORTED_APPROVAL", "UNSUPPORTED_BUDGET"} <= {w["code"] for w in response.json()["review_flags"]}
+
+
+def test_phase3_currency_and_omitted_contradiction(api):
+    owner, _, _ = account(api)
+    path, _, fixture = phase3_fixture(api, owner)
+    extra = api.post(path + "/transcript", headers=owner, json={"segments": [segment(
+        text_value="The budget of ₹15,000 is not approved after the funding review.", start=40, end=45)]}).json()[0]
+    fixture["decisions"][0]["currency"] = "USD"
+    wrong_currency = generate_fixture(api, owner, path, fixture)
+    assert any(w["code"] == "UNSUPPORTED_BUDGET" for w in wrong_currency.json()["review_flags"])
+    fixture["decisions"][0]["currency"] = "INR"
+    contradicted = generate_fixture(api, owner, path, fixture)
+    assert any(w["code"] == "AMBIGUOUS_DECISION_STATUS" and extra["id"] in w["evidence_segment_ids"] for w in contradicted.json()["review_flags"])
+
+
+def test_phase3_migration_preserves_legacy_transcripts_and_verified_minutes(api):
+    """Upgrade populated 0002 in a second transaction-scoped disposable schema."""
+    schema = "migration_" + uuid4().hex
+    user_id, meeting_id = uuid4(), uuid4()
+    cfg = Config(str(BACKEND / "alembic.ini"))
+    with api.app.state.test_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+        conn.execute(text(f'SET LOCAL search_path TO "{schema}", pg_catalog'))
+        cfg.attributes["connection"] = conn
+        command.upgrade(cfg, "0002")
+        conn.execute(text("INSERT INTO users(id,name,email,password_hash) VALUES (:u,'Legacy owner','legacy@example.com','synthetic-unused-hash')"), {"u": user_id})
+        conn.execute(text("INSERT INTO meetings(id,owner_id,title,village_name,district,state,meeting_date,primary_language,supported_languages) VALUES (:m,:u,'Legacy','Village','District','State','2026-10-15','te','[\"te\",\"en\"]'::jsonb)"), {"m": meeting_id, "u": user_id})
+        conn.execute(text("INSERT INTO transcript_segments(id,meeting_id,speaker_id,language,text,start_time,end_time) VALUES (401,:m,'speaker_1','mixed',:t,0.25,5.75)"), {"m": meeting_id, "t": "నీటి సమస్య — original Unicode ₹15,000."})
+        conn.execute(text("INSERT INTO meeting_minutes(id,meeting_id,summary,status,verifier_name,verified_at) VALUES (21,:m,'Legacy verified minutes','verified','Secretary',now())"), {"m": meeting_id})
+        conn.execute(text("INSERT INTO decisions(minutes_id,description,status,evidence_segment_ids) VALUES (21,'Allocation','approved','[401]'::jsonb)"))
+        before = dict(conn.execute(text("SELECT * FROM transcript_segments WHERE id=401")).mappings().one())
+        command.upgrade(cfg, "head")
+        after = dict(conn.execute(text("SELECT * FROM transcript_segments WHERE id=401")).mappings().one())
+        assert before == after
+        preserved = conn.execute(text("SELECT status,verifier_name,review_state FROM meeting_minutes WHERE id=21")).one()
+        assert tuple(preserved) == ("verified", "Secretary", "accepted")
+        assert conn.scalar(text("SELECT classification FROM decisions WHERE minutes_id=21")) == "approved"
+        conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))

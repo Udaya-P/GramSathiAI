@@ -91,7 +91,41 @@ def resume_transcription(meeting_id: UUID, job_id: UUID, payload: schemas.Resume
 
 
 @router.post("/{meeting_id}/minutes/generate", response_model=schemas.MinutesOut,
-             description="Evon adapter seam: returns 501 until an official contract is supplied. Generated claims require citations and human review; documents remain drafts.")
+             description="Default live Evon returns 501. Explicit mock mode requires development settings and a fixture with real persisted citations. All generated content remains a reviewed draft.")
 def generate_minutes(meeting_id: UUID, db: Db, user: CurrentUser,
-                     adapter: Annotated[evon.EvonAdapter, Depends(evon.get_evon_adapter)]):
-    return evon.generate_minutes(db, meeting_id, user.id, adapter)
+                     adapter: Annotated[evon.EvonAdapter, Depends(evon.get_evon_adapter)],
+                     request: schemas.GenerateMinutes | None = None):
+    return evon.generate_minutes(db, meeting_id, user.id, adapter, request)
+
+
+@router.get("/{meeting_id}/decisions", response_model=list[schemas.DecisionCreate])
+def get_decisions(meeting_id: UUID, db: Db, user: CurrentUser):
+    return service.get_minutes(db, meeting_id, user.id).decisions
+
+
+@router.get("/{meeting_id}/action-items", response_model=list[schemas.ActionCreate])
+def get_action_items(meeting_id: UUID, db: Db, user: CurrentUser):
+    return service.get_minutes(db, meeting_id, user.id).action_items
+
+
+@router.get("/{meeting_id}/minutes/integrity")
+def get_integrity(meeting_id: UUID, db: Db, user: CurrentUser):
+    minutes = service.get_minutes(db, meeting_id, user.id)
+    return {"revision": minutes.revision, "review_flags": minutes.review_flags}
+
+
+@router.get("/{meeting_id}/minutes/evidence")
+def get_evidence(meeting_id: UUID, db: Db, user: CurrentUser):
+    return service.minutes_evidence(db, meeting_id, user.id)
+
+
+@router.get("/{meeting_id}/minutes/history")
+def get_history(meeting_id: UUID, db: Db, user: CurrentUser):
+    minutes = service.get_minutes(db, meeting_id, user.id)
+    return {"generated_original": minutes.generated_original, "history": minutes.history}
+
+
+@router.post("/{meeting_id}/minutes/review", response_model=schemas.MinutesOut,
+             description="Owner review: reject with a comment, or approve with explicit confirmation and warning acknowledgement. This is prototype confirmation, not government approval.")
+def review_minutes(meeting_id: UUID, payload: schemas.ReviewMinutes, db: Db, user: CurrentUser):
+    return service.review_minutes(db, meeting_id, user.id, payload)
