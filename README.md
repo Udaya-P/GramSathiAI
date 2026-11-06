@@ -1,20 +1,51 @@
-# GramSathi AI — Backend
+# GramSathi AI 
 
-A multi-user FastAPI backend for manual, multilingual Gram Sabha transcripts and evidence-linked meeting minutes. Each meeting belongs to one user. Minutes stay drafts until explicit owner confirmation; this is **prototype confirmation, not legally authenticated government approval**.
+GramSathi AI is a multilingual Gram Sabha meeting intelligence application built using FastAPI, Streamlit, PostgreSQL, and Gnani Prisma STT.
+
+The system supports meeting management, English/Telugu/Kannada/Hindi transcription, speaker diarization, evidence-linked meeting minutes, decision tracking, action items, and human verification.
+
+Meeting minutes remain drafts until explicitly verified by the meeting owner. Verification is prototype confirmation, not legally authenticated government approval.
 
 Python 3.11+, FastAPI, Pydantic v2, PostgreSQL, synchronous SQLAlchemy 2, Alembic, psycopg, Argon2/pwdlib and signed JWTs. Streamlit will be deployed separately.
 
 ```text
-backend/
-  app/
-    main.py, config.py, database.py, models.py, schemas.py, security.py
-    routes/auth.py, routes/meetings.py
-    services/meeting_service.py, integrity.py, evon.py, prisma.py, transcription_service.py
-    worker.py
-  alembic/env.py, alembic/script.py.mako, alembic/versions/0001_initial.py
-  tests/test_backend.py
-  data/sample_meeting.json
-  alembic.ini, requirements.txt
+GramSathiAI/
+├── backend/
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   ├── models.py
+│   │   ├── schemas.py
+│   │   ├── security.py
+│   │   ├── routes/
+│   │   │   ├── auth.py
+│   │   │   └── meetings.py
+│   │   ├── services/
+│   │   │   ├── meeting_service.py
+│   │   │   ├── transcription_service.py
+│   │   │   ├── prisma.py
+│   │   │   ├── evon.py
+│   │   │   └── integrity.py
+│   │   └── worker.py
+│   ├── alembic/
+│   │   └── versions/
+│   │       ├── 0001_initial.py
+│   │       ├── 0002_transcription_jobs.py
+│   │       └── 0003_meeting_intelligence.py
+│   ├── tests/
+│   │   └── test_backend.py
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/
+│   ├── app.py
+│   ├── components.py
+│   ├── styles.py
+│   ├── requirements.txt
+│   └── .env.example
+├── sample_audio/
+├── README.md
+└── .gitignore
 ```
 
 ## Setup and run
@@ -72,8 +103,21 @@ For future schema changes: `alembic revision --autogenerate -m "describe change"
 
 ## Scope
 
-Manual transcript/minutes APIs remain compatible. Recorded meetings now support queued Prisma v3.0 Batch transcription. No frontend, translation, voice output or PDF export is implemented. The Phase 3 pipeline works with explicit development fixtures; live Evon reasoning remains disabled until its official API contract is available. Keep Gnani credentials exclusively on the backend.
+GramSathi AI currently includes:
 
+- **Backend:** FastAPI REST APIs with JWT authentication and PostgreSQL persistence.
+- **Frontend:** Streamlit interface for meeting creation, audio upload, transcript viewing, meeting minutes, and verification.
+- **Speech-to-Text:** Gnani Prisma v3.0 Batch transcription supporting English, Telugu, Kannada, Hindi, and code-mixed speech.
+- **Speaker Diarization:** Anonymous speaker identification based on audio.
+- **Meeting Intelligence:** Evidence-grounded structured decisions, action items, unresolved issues, and integrity warnings.
+- **Human Verification:** Draft review, correction, approval, and audit history.
+
+### Current Limitations
+
+- Live Gnani Evon reasoning is not yet integrated; development-only mock fixtures are supported.
+- Automatic AI-generated minutes are unavailable in production until Evon integration is completed.
+- PDF export, Timbre voice playback, and transcript segment editing are not yet implemented.
+- Human verification represents prototype confirmation, not legally authenticated government approval.
 
 ## Prisma v3.0 Batch transcription
 
@@ -120,6 +164,25 @@ There is no documented idempotency guarantee for a provider create request. The 
 
 Deleting a meeting cascades its local jobs, raw results and segments. It does not cancel an already submitted provider job; provider-side retention/cancellation is a separate operation.
 
+## Evon adapter status
+
+**POST `/api/v1/meetings/{meeting_id}/minutes/generate`** is an authenticated extension point and returns **501** after a transcript exists. No real or simulated AI-generated content is returned. Official Evon documentation is still needed for its endpoint/base URL, authentication, model, request/response schema, evidence/citation format, limits and job lifecycle. No Evon endpoint was guessed.
+
+`MockEvonAdapter` accepts an explicit test fixture; it is only injected by tests. All generated entries require nonempty stable segment citations. Missing/foreign IDs are rejected with 422 and unsupported-evidence flags, without saving. Valid references establish provenance, not semantic support: every generated decision, action and issue carries `claim_support_unverified` in persisted `review_flags` until human confirmation. The existing manual minutes API remains available; no automated entailment check is claimed.
+
+## Streamlit frontend
+
+The frontend lives in `frontend/` and talks to FastAPI only over HTTP (it never touches the database or Gnani).
+
+```bash
+pip install -r frontend/requirements.txt
+cp frontend/.env.example frontend/.env   # set API_BASE_URL to your FastAPI URL
+streamlit run frontend/app.py            # run from the repo root so .streamlit/config.toml (theme) is used
+```
+
+Pages: Dashboard, All Meetings, Create New Meeting, Audio & Transcripts (M4A upload, job status, transcript), Meeting Minutes (read and edit, suggestion vs approved resolution, evidence), and Verification (prototype human confirmation, not government approval). Shared styling is in `frontend/styles.py` and reusable pieces in `frontend/components.py`.
+
+Not available yet because the backend has no API for them: editing or deleting existing transcript segments, Timbre voice playback (the player is shown disabled), PDF export, and AI-drafted minutes (the Evon endpoint returns 501). Audio jobs only progress while the backend worker is running. Sessions are kept in memory, so a browser refresh requires logging in again.
 ## Phase 3: evidence-grounded meeting intelligence
 
 The default **POST `/api/v1/meetings/{meeting_id}/minutes/generate`** still returns **501** for live Evon. A provider-independent `ReasoningProvider` consumes persisted segments and returns an untrusted structured candidate. No other commercial LLM replaces Evon. `MockEvonAdapter` deterministically returns a caller-supplied fixture; it does **not** extract facts or simulate a real model.
