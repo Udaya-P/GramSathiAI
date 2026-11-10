@@ -3,6 +3,7 @@ import streamlit as st
 import api_client as api
 import components as c
 import ui
+from recording_player import play_recording, play_segment
 
 MAX_BYTES = 10 * 1024 * 1024
 AUDIO_LANGS = {
@@ -103,6 +104,9 @@ def _jobs(token, meeting_id):
                 st.error(f"This job could not finish (code: {j['error_code']}). Ask your administrator to check it.")
             for w in j["warnings"]:
                 st.caption(f"Note: {w}")
+            if j.get("filename"):
+                st.text(j["filename"])
+            play_recording(token, meeting_id, j["id"], key=f"job-{j['id']}", label="Play original recording")
 
 
 def _transcript(ctx, meeting):
@@ -121,6 +125,7 @@ def _transcript(ctx, meeting):
         st.caption(f"Showing {len(shown)} of {len(segments)} segments · times are minutes:seconds")
         for s in shown:
             c.segment_card(s)
+            play_segment(ctx, s, key="transcript", label=f"Play segment #{s['id']}")
         if not shown:
             st.info("No segments match your search.")
         st.caption("Segment numbers (like #8) are used as evidence in the minutes. "

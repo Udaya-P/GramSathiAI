@@ -27,26 +27,44 @@ def render():
 
     st.markdown("#### What you are confirming")
     st.caption("Each decision and action below is linked to the words in the transcript that support it.")
-    c.minutes_document(minutes, ctx["by_id"], expand_evidence=True)
+    c.minutes_document(minutes, ctx["by_id"], expand_evidence=True, playback=ctx)
     c.voice_player(minutes)
 
     if ctx["status"] == "verified":
+        if st.button("Prepare PDF", icon=":material/picture_as_pdf:"):
+            meeting_id = ctx["meeting"]["id"]
+            try:
+                with st.spinner("Preparing verified minutes…"):
+                    pdf = api.download_minutes_pdf(ctx["token"], meeting_id)
+            except api.ApiError as exc:
+                ui.handle_error(exc)
+            else:
+                st.download_button("Download PDF", pdf, file_name=f"gramsathi-minutes-{meeting_id}.pdf",
+                                   mime="application/pdf", on_click="ignore", icon=":material/download:")
         return
     st.divider()
     st.markdown("### Confirm the minutes")
-    with st.form("verify"):
+    warnings_pending = any(not flag.get("acknowledged") for flag in minutes.get("review_flags", []))
+    with st.form(f"verify_{ctx['meeting']['id']}_{minutes.get('revision')}"):
         name = st.text_input("Your full name", placeholder="The person confirming these minutes")
         confirmed = st.checkbox("I have read these minutes and checked them against the transcript. "
                                 "I confirm they are accurate.")
+        acknowledge = False
+        if warnings_pending:
+            acknowledge = st.checkbox("I have reviewed the integrity warnings.")
         submitted = st.form_submit_button("Verify minutes", type="primary")
     if not submitted:
         return
     if not name.strip() or not confirmed:
         st.error("Enter your name and tick the confirmation box.")
         return
+    if warnings_pending and not acknowledge:
+        st.error("Acknowledge the integrity warnings before verifying.")
+        return
     try:
         with st.spinner("Verifying…"):
-            result = api.verify_minutes(ctx["token"], ctx["meeting"]["id"], name.strip())
+            result = api.verify_minutes(ctx["token"], ctx["meeting"]["id"], name.strip(),
+                                        acknowledge_warnings=acknowledge, expected_revision=minutes.get("revision"))
     except api.ApiError as exc:
         ui.handle_error(exc)
         return

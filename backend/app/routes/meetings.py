@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from app import schemas
 from app.security import CurrentUser, Db
 from app.services import meeting_service as service
-from app.services import transcription_service, evon
+from app.services import transcription_service, evon, minutes_pdf, recording_storage
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["Meetings"])
 
@@ -53,6 +53,17 @@ def get_minutes(meeting_id: UUID, db: Db, user: CurrentUser):
     return service.get_minutes(db, meeting_id, user.id)
 
 
+@router.get("/{meeting_id}/minutes/pdf", response_class=Response,
+            responses={200: {"content": {"application/pdf": {"schema": {"type": "string", "format": "binary"}}}}},
+            description="Download the verified minutes as a prototype PDF meeting record.")
+def download_minutes_pdf(meeting_id: UUID, db: Db, user: CurrentUser):
+    pdf = minutes_pdf.export_verified_minutes(db, meeting_id, user.id)
+    return Response(pdf, media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="gramsathi-minutes-{meeting_id}.pdf"',
+        "Cache-Control": "private, no-store",
+    })
+
+
 @router.post("/{meeting_id}/minutes/verify", response_model=schemas.MinutesOut,
              description="Prototype owner confirmation only; not legally authenticated government approval.")
 def verify_minutes(meeting_id: UUID, payload: schemas.Verification, db: Db, user: CurrentUser):
@@ -84,6 +95,16 @@ def transcription_status(meeting_id: UUID, job_id: UUID, db: Db, user: CurrentUs
     return transcription_service.get_job(db, meeting_id, user.id, job_id)
 
 
+@router.get("/{meeting_id}/transcriptions/{job_id}/audio", response_class=Response,
+            responses={200: {"content": {"audio/mp4": {"schema": {"type": "string", "format": "binary"}}}},
+                       206: {"description": "Requested byte range"},
+                       404: {"description": "Recording unavailable"},
+                       416: {"description": "Range not satisfiable"}},
+            description="Play the private original M4A. Supports HTTP byte ranges.")
+def recording_audio(meeting_id: UUID, job_id: UUID, db: Db, user: CurrentUser):
+    return recording_storage.playback(transcription_service.get_job(db, meeting_id, user.id, job_id))
+
+
 @router.post("/{meeting_id}/transcriptions/{job_id}/resume", response_model=schemas.TranscriptionJobOut,
              description="Reconcile an ambiguous create using its real provider job ID. The worker checks the opaque upload name and configuration before starting/importing.")
 def resume_transcription(meeting_id: UUID, job_id: UUID, payload: schemas.ResumeTranscription, db: Db, user: CurrentUser):
@@ -91,7 +112,7 @@ def resume_transcription(meeting_id: UUID, job_id: UUID, payload: schemas.Resume
 
 
 @router.post("/{meeting_id}/minutes/generate", response_model=schemas.MinutesOut,
-             description="Default live Evon returns 501. Explicit mock mode requires development settings and a fixture with real persisted citations. All generated content remains a reviewed draft.")
+             description="Generate an evidence-linked draft with Groq. Explicit Evon remains unavailable. Mock mode requires development settings and a fixture.")
 def generate_minutes(meeting_id: UUID, db: Db, user: CurrentUser,
                      adapter: Annotated[evon.EvonAdapter, Depends(evon.get_evon_adapter)],
                      request: schemas.GenerateMinutes | None = None):

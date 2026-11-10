@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.models import TranscriptionJob
+from app.services import recording_storage
 from app.services.meeting_service import owned_meeting
 from app.services.prisma import LANGUAGES, MAX_AUDIO_BYTES
 
@@ -32,11 +33,13 @@ def submit(db, meeting_id, owner_id, upload, language_code):
     if previous:
         if set(previous.language_codes) != set(codes):
             raise HTTPException(409, "This recording is already submitted with different language options")
+        recording_storage.retain(previous, audio)
         return previous, False
     job = TranscriptionJob(meeting_id=meeting_id, filename=name, audio_sha256=digest,
                            audio_data=audio, language_codes=codes)
     db.add(job)
     db.flush()
+    recording_storage.retain(job, audio)
     return job, True
 
 

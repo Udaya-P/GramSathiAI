@@ -76,6 +76,7 @@ class MeetingMinutes(Base):
     review_flags: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
     summary_evidence_segment_ids: Mapped[list[int]] = mapped_column(JSONB, default=list, server_default="[]")
     summary_claims: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
+    generation_model: Mapped[str | None] = mapped_column(String(200))
     generation_source: Mapped[str] = mapped_column(String(20), default="manual", server_default="manual")
     review_state: Mapped[str] = mapped_column(String(10), default="pending", server_default="pending")
     revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")

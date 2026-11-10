@@ -28,6 +28,10 @@ def _detail_message(response: requests.Response) -> str:
         return ""
     if isinstance(detail, str):
         return detail
+    if isinstance(detail, dict):
+        explanations = [flag.get("explanation") for flag in detail.get("review_flags", [])
+                        if flag.get("severity") == "error" and flag.get("explanation")]
+        return " ".join(explanations[:3])
     if isinstance(detail, list):  # FastAPI/Pydantic 422 list
         parts = []
         for err in detail:
@@ -37,7 +41,7 @@ def _detail_message(response: requests.Response) -> str:
     return ""
 
 
-def request(method: str, path: str, token: str | None = None, **kwargs):
+def request(method: str, path: str, token: str | None = None, *, as_pdf=False, as_audio=False, **kwargs):
     headers = kwargs.pop("headers", {})
     timeout = kwargs.pop("timeout", TIMEOUT)
     if token:
@@ -52,6 +56,14 @@ def request(method: str, path: str, token: str | None = None, **kwargs):
         raise ApiError(f"Request failed: {exc}") from None
 
     if response.ok:
+        if as_pdf:
+            if not response.content.startswith(b"%PDF-"):
+                raise ApiError("The server did not return a PDF.")
+            return response.content
+        if as_audio:
+            if response.headers.get("Content-Type") != "audio/mp4" or not response.content:
+                raise ApiError("The server did not return a playable recording.")
+            return response.content
         return response.json() if response.content else None
 
     detail = _detail_message(response)
@@ -121,13 +133,18 @@ def get_minutes(token, meeting_id):
         raise
 
 
+def download_minutes_pdf(token, meeting_id):
+    return request("GET", f"/api/v1/meetings/{meeting_id}/minutes/pdf", token, as_pdf=True)
+
+
 def save_minutes(token, meeting_id, payload):
     return request("POST", f"/api/v1/meetings/{meeting_id}/minutes", token, json=payload)
 
 
-def verify_minutes(token, meeting_id, verifier_name):
+def verify_minutes(token, meeting_id, verifier_name, *, acknowledge_warnings=False, expected_revision=None):
     return request("POST", f"/api/v1/meetings/{meeting_id}/minutes/verify", token,
-                   json={"verifier_name": verifier_name, "confirmed": True})
+                   json={"verifier_name": verifier_name, "confirmed": True,
+                         "acknowledge_warnings": acknowledge_warnings, "expected_revision": expected_revision})
 
 
 # --- transcription jobs (Prisma) and AI minutes ----------------------------
@@ -142,5 +159,10 @@ def list_transcriptions(token, meeting_id):
     return request("GET", f"/api/v1/meetings/{meeting_id}/transcriptions", token)
 
 
+def get_recording(token, meeting_id, job_id):
+    return request("GET", f"/api/v1/meetings/{meeting_id}/transcriptions/{job_id}/audio", token, as_audio=True)
+
+
 def generate_minutes(token, meeting_id):
-    return request("POST", f"/api/v1/meetings/{meeting_id}/minutes/generate", token)
+    return request("POST", f"/api/v1/meetings/{meeting_id}/minutes/generate", token,
+                   json={"provider": "groq"}, timeout=120)

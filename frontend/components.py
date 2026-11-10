@@ -7,6 +7,7 @@ import streamlit as st
 
 import api_client as api
 import ui
+from recording_player import play_segment
 
 STATUS = {  # minutes status -> (label, chip tone)
     "none": ("No minutes yet", "neutral"),
@@ -18,6 +19,8 @@ DECISION = {  # decision status -> (label, hint, chip tone)
     "approved": ("Approved resolution", "Agreed by the meeting", "green"),
     "proposed": ("Suggestion", "Proposed, not yet agreed", "amber"),
     "rejected": ("Rejected proposal", "Discussed and turned down", "red"),
+    "deferred": ("Deferred", "Decision postponed", "amber"),
+    "unclear": ("Unclear", "Outcome needs review", "neutral"),
 }
 
 
@@ -77,15 +80,22 @@ def segment_card(s: dict):
         f'<div class="gs-seg-text">{escape(s["text"])}</div></div>', unsafe_allow_html=True)
 
 
-def evidence(ids: list, by_id: dict, expanded: bool = False):
+def evidence(ids: list, by_id: dict, expanded: bool = False, quotes=(), *, playback=None, key=""):
+    if not ids:
+        return
     label = "Supporting transcript: " + ", ".join(f"#{i}" for i in ids)
     with st.expander(label, expanded=expanded):
-        for i in ids:
+        for i in dict.fromkeys(ids):
             s = by_id.get(i)
             if s:
                 segment_card(s)
+                if playback:
+                    play_segment(playback, s, key=key, label=f"Play evidence #{i}")
             else:
                 st.warning(f"Segment #{i} was not found in the transcript.")
+        for quote in quotes:
+            st.caption(f"Quote from segment #{quote['segment_id']}")
+            st.text(quote["quote"])
 
 
 def voice_player(minutes: dict | None):
@@ -150,37 +160,70 @@ def _item(tone: str, chip_html: str, title: str, meta: str = ""):
                 + (f'<div class="gs-item-meta">{meta}</div>' if meta else "") + "</div>", unsafe_allow_html=True)
 
 
-def minutes_document(minutes: dict, by_id: dict, expand_evidence: bool = False):
-    """Summary, decisions (suggestion vs approved vs rejected), actions and open issues."""
+def minutes_document(minutes: dict, by_id: dict, expand_evidence: bool = False, *, playback=None):
+    """Show the structured draft and its review evidence."""
+    source = minutes.get("generation_source")
+    if source == "groq":
+        st.caption(f"AI draft via Groq · {minutes.get('generation_model') or 'configured model'}")
+    elif source == "mock_fixture":
+        st.caption("Development fixture draft")
+
     st.markdown("### Meeting summary")
     with st.container(border=True):
-        st.write(minutes["summary"])
+        st.text(minutes["summary"])
+        evidence(minutes.get("summary_evidence_segment_ids", []), by_id, expand_evidence,
+                 playback=playback, key="summary")
+        for index, claim in enumerate(minutes.get("summary_claims", [])):
+            st.text(claim["text"])
+            evidence(claim["evidence_segment_ids"], by_id, expand_evidence, claim.get("evidence_quotes", []),
+                     playback=playback, key=f"claim-{index}")
 
     st.markdown("### Decisions")
     if not minutes["decisions"]:
         st.caption("No decisions were recorded.")
-    for status in ("approved", "proposed", "rejected"):
-        group = [d for d in minutes["decisions"] if d["status"] == status]
-        if not group:
-            continue
+    for index, decision in enumerate(minutes["decisions"]):
+        status = decision.get("classification") or decision["status"]
         label, hint, tone = DECISION[status]
-        st.markdown(f"**{label}s** · {len(group)}" if status != "proposed" else f"**Suggestions** · {len(group)}")
-        for d in group:
-            _item(status, chip(label, tone) + f' <span class="gs-item-meta">{escape(hint)}</span>', d["description"])
-            evidence(d["evidence_segment_ids"], by_id, expand_evidence)
+        _item(status, chip(label, tone) + f' <span class="gs-item-meta">{escape(hint)}</span>', decision["description"])
+        amounts = [f"{role} {decision.get('currency') or ''} {decision[field]}".replace("  ", " ")
+                   for role, field in (("Estimate", "estimated_amount"), ("Proposed", "proposed_amount"),
+                                       ("Approved", "approved_amount")) if decision.get(field) is not None]
+        if amounts:
+            st.caption(" · ".join(amounts))
+        evidence(decision["evidence_segment_ids"], by_id, expand_evidence, decision.get("evidence_quotes", []),
+                 playback=playback, key=f"decision-{index}")
 
     st.markdown("### Action items")
     if not minutes["action_items"]:
         st.caption("No action items were recorded.")
-    for a in minutes["action_items"]:
-        deadline = ui.fmt_date(a["deadline"]) if a["deadline"] else "No deadline set"
-        _item("", chip("Action", "blue"), a["task"],
-              f"Responsible: <b>{escape(a['assigned_to'])}</b> &nbsp;·&nbsp; Deadline: <b>{escape(deadline)}</b>")
-        evidence(a["evidence_segment_ids"], by_id, expand_evidence)
+    for index, action in enumerate(minutes["action_items"]):
+        deadline = " · ".join(filter(None, [ui.fmt_date(action.get("deadline")), action.get("deadline_text")]))
+        assignee = action.get("assigned_to") or "Unassigned"
+        _item("", chip("Action", "blue"), action["task"],
+              f"Responsible: <b>{escape(assignee)}</b> &nbsp;·&nbsp; Deadline: <b>{escape(deadline or 'No deadline set')}</b>")
+        evidence(action["evidence_segment_ids"], by_id, expand_evidence, action.get("evidence_quotes", []),
+                 playback=playback, key=f"action-{index}")
 
     st.markdown("### Unresolved issues")
     if not minutes["unresolved_issues"]:
         st.caption("No unresolved issues.")
-    for u in minutes["unresolved_issues"]:
-        _item("", chip("Open", "neutral"), u["description"])
-        evidence(u["evidence_segment_ids"], by_id, expand_evidence)
+    for index, issue in enumerate(minutes["unresolved_issues"]):
+        _item("", chip("Open", "neutral"), issue["description"])
+        evidence(issue["evidence_segment_ids"], by_id, expand_evidence, issue.get("evidence_quotes", []),
+                 playback=playback, key=f"issue-{index}")
+
+    flags = minutes.get("review_flags", [])
+    if flags:
+        with st.expander(f"Integrity warnings ({len(flags)})", expanded=expand_evidence):
+            for index, flag in enumerate(flags):
+                ids = flag.get("evidence_segment_ids", [])
+                location = flag.get("entity", "Draft")
+                code = flag.get("code", "Review")
+                acknowledged = " · Acknowledged" if flag.get("acknowledged") else ""
+                references = " · " + ", ".join(f"#{i}" for i in ids) if ids else ""
+                st.text(f"{code} · {location}{references}{acknowledged}")
+                st.text(flag.get("explanation", "Review this item against its transcript evidence."))
+                if playback:
+                    for i in dict.fromkeys(ids):
+                        if i in by_id:
+                            play_segment(playback, by_id[i], key=f"warning-{index}", label=f"Play evidence #{i}")

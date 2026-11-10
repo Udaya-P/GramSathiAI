@@ -101,7 +101,7 @@ def _history_entry(db, minutes, owner_id, event, **metadata):
     return entry
 
 
-def save_minutes(db: Session, meeting_id: UUID, owner_id: UUID, payload: schemas.MinutesCreate, *, source="manual"):
+def save_minutes(db: Session, meeting_id: UUID, owner_id: UUID, payload: schemas.MinutesCreate, *, source="manual", source_model=None):
     owned_meeting(db, meeting_id, owner_id, lock=True)
     minutes = db.scalar(select(models.MeetingMinutes).where(models.MeetingMinutes.meeting_id == meeting_id))
     if minutes and minutes.status == "verified":
@@ -129,6 +129,7 @@ def save_minutes(db: Session, meeting_id: UUID, owner_id: UUID, payload: schemas
     minutes.review_state = "pending"
     if source != "manual" or minutes.generated_original is None:
         minutes.generation_source = source
+        minutes.generation_model = source_model
     minutes.decisions = [models.Decision(**d.model_dump()) for d in payload.decisions]
     minutes.action_items = [models.ActionItem(**a.model_dump()) for a in payload.action_items]
     minutes.unresolved_issues = [models.UnresolvedIssue(**i.model_dump()) for i in payload.unresolved_issues]

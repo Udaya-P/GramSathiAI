@@ -1,0 +1,16 @@
+"""Store the model used for a generated minutes draft."""
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0004"
+down_revision = "0003"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.add_column("meeting_minutes", sa.Column("generation_model", sa.String(200), nullable=True))
+
+
+def downgrade():
+    op.drop_column("meeting_minutes", "generation_model")

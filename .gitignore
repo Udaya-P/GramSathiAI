@@ -16,3 +16,4 @@ __pycache__/
 
 # Sample recordings
 sample_audio/
+.recordings/

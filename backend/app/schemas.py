@@ -189,6 +189,7 @@ class MinutesOut(MinutesCreate):
     created_at: datetime
     review_flags: list[dict] = Field(default_factory=list)
     generation_source: str = "manual"
+    generation_model: str | None = None
     review_state: Literal["pending", "rejected", "accepted"] = "pending"
     revision: int = 1
 
@@ -210,7 +211,7 @@ class Verification(Schema):
 
 
 class GenerateMinutes(Schema):
-    provider: Literal["evon", "mock"] = "evon"
+    provider: Literal["groq", "evon", "mock"] = "groq"
     fixture: MinutesCreate | None = None
 
     @model_validator(mode="after")

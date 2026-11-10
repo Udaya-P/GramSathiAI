@@ -11,6 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy.engine import make_url
 
 
+DEFAULT_AUDIO_STORAGE_DIR = Path(__file__).resolve().parents[1] / ".recordings"
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     database_url: SecretStr
@@ -19,6 +22,9 @@ class Settings(BaseModel):
     access_token_minutes: int = Field(default=30, ge=1, le=60)
     cors_origins: list[str] = Field(default_factory=list)
     gnani_api_key: SecretStr | None = None
+    audio_storage_dir: Path = DEFAULT_AUDIO_STORAGE_DIR
+    groq_api_key: SecretStr | None = None
+    groq_model: str = Field(default="llama-3.3-70b-versatile", min_length=1, max_length=200)
     app_environment: Literal["development", "test", "production"] = "production"
     enable_mock_reasoning: bool = False
 
@@ -59,6 +65,9 @@ def get_settings() -> Settings:
         access_token_minutes=os.getenv("ACCESS_TOKEN_MINUTES", "30"),
         cors_origins=json.loads(os.getenv("CORS_ORIGINS", "[]")),
         gnani_api_key=os.getenv("GNANI_API_KEY") or None,
+        audio_storage_dir=Path(os.getenv("AUDIO_STORAGE_DIR") or DEFAULT_AUDIO_STORAGE_DIR).expanduser(),
+        groq_api_key=os.getenv("GROQ_API_KEY", "").strip() or None,
+        groq_model=os.getenv("GROQ_MODEL", "").strip() or "llama-3.3-70b-versatile",
         app_environment=os.getenv("APP_ENVIRONMENT", "production"),
         enable_mock_reasoning=os.getenv("ENABLE_MOCK_REASONING", "false"),
     )

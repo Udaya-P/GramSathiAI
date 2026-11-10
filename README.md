@@ -32,7 +32,8 @@ GramSathiAI/
 │   │   └── versions/
 │   │       ├── 0001_initial.py
 │   │       ├── 0002_transcription_jobs.py
-│   │       └── 0003_meeting_intelligence.py
+│   │       ├── 0003_meeting_intelligence.py
+│   │       └── 0004_generation_model.py
 │   ├── tests/
 │   │   └── test_backend.py
 │   ├── requirements.txt
@@ -115,8 +116,8 @@ GramSathi AI currently includes:
 ### Current Limitations
 
 - Live Gnani Evon reasoning is not yet integrated; development-only mock fixtures are supported.
-- Automatic AI-generated minutes are unavailable in production until Evon integration is completed.
-- PDF export, Timbre voice playback, and transcript segment editing are not yet implemented.
+- Groq draft generation requires an API key and model access.
+- Timbre voice playback and transcript segment editing are not yet implemented.
 - Human verification represents prototype confirmation, not legally authenticated government approval.
 
 ## Prisma v3.0 Batch transcription
@@ -164,11 +165,20 @@ There is no documented idempotency guarantee for a provider create request. The 
 
 Deleting a meeting cascades its local jobs, raw results and segments. It does not cancel an already submitted provider job; provider-side retention/cancellation is a separate operation.
 
-## Evon adapter status
+## Groq minutes generation
 
-**POST `/api/v1/meetings/{meeting_id}/minutes/generate`** is an authenticated extension point and returns **501** after a transcript exists. No real or simulated AI-generated content is returned. Official Evon documentation is still needed for its endpoint/base URL, authentication, model, request/response schema, evidence/citation format, limits and job lifecycle. No Evon endpoint was guessed.
+The default `POST /api/v1/meetings/{meeting_id}/minutes/generate` uses Groq. Set the following in the backend environment and apply `python -m alembic upgrade head` from `backend/`. Revision `0004` adds a nullable model label to minutes.
 
-`MockEvonAdapter` accepts an explicit test fixture; it is only injected by tests. All generated entries require nonempty stable segment citations. Missing/foreign IDs are rejected with 422 and unsupported-evidence flags, without saving. Valid references establish provenance, not semantic support: every generated decision, action and issue carries `claim_support_unverified` in persisted `review_flags` until human confirmation. The existing manual minutes API remains available; no automated entailment check is claimed.
+```dotenv
+GROQ_API_KEY=your_groq_key
+GROQ_MODEL=llama-3.3-70b-versatile
+```
+
+Groq lists Llama 3.3 70B as Enterprise and publishes a shutdown date for the deprecated offering. If your account lacks access, explicitly set `GROQ_MODEL=openai/gpt-oss-120b`, a documented replacement with JSON Object Mode. The backend uses the configured model and displays the model reported by the provider. [Supported models](https://console.groq.com/docs/models) · [Deprecations](https://console.groq.com/docs/deprecations)
+
+Restart FastAPI, open a meeting with a transcript and no minutes, and select **Draft with AI**. This sends the meeting's transcript text and segment metadata to Groq and uses your Groq account's quota. A successful request saves a draft with citations and integrity warnings. Inspect the evidence, edit if needed, then acknowledge the warnings on the Verification page.
+
+The integration sends one request for the full transcript, up to 100,000 UTF-8 bytes of serialized segment data. Provider limits may be lower. The SDK allows one retry for transient HTTP or connection failures. The application validates JSON against `MinutesCreate` and checks citations before saving. Semantic support still requires a human review. Use `{"provider":"evon"}` to select the reserved Evon adapter, which returns 501. The development fixture path is explicitly selected with `provider: "mock"`.
 
 ## Streamlit frontend
 
@@ -182,10 +192,25 @@ streamlit run frontend/app.py            # run from the repo root so .streamlit/
 
 Pages: Dashboard, All Meetings, Create New Meeting, Audio & Transcripts (M4A upload, job status, transcript), Meeting Minutes (read and edit, suggestion vs approved resolution, evidence), and Verification (prototype human confirmation, not government approval). Shared styling is in `frontend/styles.py` and reusable pieces in `frontend/components.py`.
 
-Not available yet because the backend has no API for them: editing or deleting existing transcript segments, Timbre voice playback (the player is shown disabled), PDF export, and AI-drafted minutes (the Evon endpoint returns 501). Audio jobs only progress while the backend worker is running. Sessions are kept in memory, so a browser refresh requires logging in again.
+Editing or deleting existing transcript segments and Timbre voice playback are unavailable. Audio jobs only progress while the backend worker is running. Sessions are kept in memory, so a browser refresh requires logging in again.
+
+### Original recording and evidence playback
+
+In **Audio & Transcripts**, select **Play original recording** on a job or **Play segment** beside a transcript entry. In **Meeting Minutes** and **Verification**, open a supporting transcript citation and select **Play evidence**. Clips start at the cited timestamp and pause near the end. Check **Continue past the segment end** to listen further. If the browser blocks autoplay, press Play in the player.
+
+The API retains each validated original M4A (up to 10 MiB) separately from the worker's temporary queue bytes. Set `AUDIO_STORAGE_DIR` in the backend environment to a private, writable persistent volume in deployment. All API replicas must see the same directory. Locally it defaults to `backend/.recordings`. Exclude it from public/static serving. Budget storage and backups for retained originals. Files do not expire automatically, and meeting deletion revokes access but leaves the archived file for operator-managed cleanup.
+
+The owner-only `GET /api/v1/meetings/{meeting_id}/transcriptions/{job_id}/audio` requires a bearer token and supports HTTP byte ranges. Streamlit requests the capped file server-side and plays it in the requesting browser session. For older jobs without a retained copy, choose the identical M4A and language selection in the same meeting and click **Start transcription**. The API recognizes the duplicate and restores playback under the existing job ID, keeping existing transcript IDs. Manually entered segments have no recording link. Playback and duplicate restoration do not require the worker or a provider API key.
+
+## Export verified minutes as a PDF
+
+Install the updated backend requirements and restart FastAPI and Streamlit. On **Verification**, open verified minutes and click **Prepare PDF**, then **Download PDF**. The API endpoint is `GET /api/v1/meetings/{meeting_id}/minutes/pdf`, using the existing bearer token. Only the meeting owner can export, and draft minutes return `409`.
+
+The PDF includes the meeting details, draft origin, human verification, decisions and budgets, action items, unresolved issues, and cited transcript quotes or excerpts. It is labeled as a prototype-generated meeting record. Embedded [Noto fonts](https://github.com/notofonts/noto-fonts) cover English, Hindi, Telugu, and Kannada. The bundled fonts ship with their SIL Open Font License under `backend/app/assets/fonts/`.
+
 ## Phase 3: evidence-grounded meeting intelligence
 
-The default **POST `/api/v1/meetings/{meeting_id}/minutes/generate`** still returns **501** for live Evon. A provider-independent `ReasoningProvider` consumes persisted segments and returns an untrusted structured candidate. No other commercial LLM replaces Evon. `MockEvonAdapter` deterministically returns a caller-supplied fixture; it does **not** extract facts or simulate a real model.
+Groq and development fixtures use the same provider-independent `ReasoningProvider` contract. `MockEvonAdapter` returns a caller-supplied fixture for testing the grounding and review workflow.
 
 Apply migration **`0003`** with `alembic upgrade head`. It adds optional amount/classification/deadline/quote fields, summary citations, and versioned draft/review history. Existing transcript/job tables and IDs are untouched. Verified legacy minutes remain verified. Before deploying to Neon, test the migration on an isolated branch and run Alembic using its direct (non-pooled) connection; the changes here were tested on disposable local PostgreSQL.
 

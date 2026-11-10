@@ -1,8 +1,4 @@
-"""Provider-independent extraction seam. There is no live Evon contract yet.
-
-No HTTP client, guessed endpoint, model name, credential format, or other LLM.
-A fixture is explicitly supplied to mock mode; no hardcoded meeting extraction.
-"""
+"""Reasoning provider dispatch and the reserved Evon adapter."""
 from typing import Protocol
 
 from fastapi import HTTPException
@@ -11,6 +7,7 @@ from sqlalchemy import select
 from app import models, schemas
 from app.config import get_settings
 from app.services import meeting_service
+from app.services.groq_reasoning import GroqReasoningAdapter
 
 MISSING_CONTRACT = (
     "Live Evon generation is unavailable: official endpoint/base URL, authentication, "
@@ -53,21 +50,32 @@ def get_evon_adapter():
 
 
 def generate_minutes(db, meeting_id, owner_id, adapter: ReasoningProvider, request=None):
-    meeting_service.owned_meeting(db, meeting_id, owner_id, lock=True)
-    existing = db.scalar(select(models.MeetingMinutes).where(models.MeetingMinutes.meeting_id == meeting_id))
+    meeting = meeting_service.owned_meeting(db, meeting_id, owner_id, lock=True)
+    minutes_query = select(models.MeetingMinutes).where(models.MeetingMinutes.meeting_id == meeting_id)
+    existing = db.scalar(minutes_query)
     if existing and existing.status == "verified":
         raise HTTPException(409, "Verified minutes cannot be overwritten")
     segments = meeting_service.ordered_segments(db, meeting_id)
     if not segments:
         raise HTTPException(409, "A transcript is required before reasoning")
-    if request and request.provider == "mock":
+    provider = request.provider if request else "groq"
+    if provider == "groq":
+        settings = get_settings()
+        key = settings.groq_api_key
+        adapter = GroqReasoningAdapter(key.get_secret_value() if key else None, settings.groq_model)
+    elif provider == "mock":
         adapter = MockEvonAdapter(request.fixture.model_dump())
     if adapter.name == "mock_fixture":
         settings = get_settings()
         if settings.app_environment not in {"development", "test"} or not settings.enable_mock_reasoning:
             raise HTTPException(403, "Mock reasoning is development/test only; enable APP_ENVIRONMENT and ENABLE_MOCK_REASONING explicitly")
+    meeting_snapshot = schemas.MeetingOut.model_validate(meeting)
+    draft_version = (existing.id, existing.revision) if existing else None
+    transcript = [schemas.SegmentOut.model_validate(s).model_dump(mode="json") for s in segments]
+    # End the snapshot transaction before waiting on the external provider.
+    db.rollback()
     try:
-        raw = adapter.generate([schemas.SegmentOut.model_validate(s).model_dump(mode="json") for s in segments])
+        raw = adapter.generate(transcript)
         # Revalidate even provider-created Pydantic instances; do not trust an
         # adapter that used model_construct() or mutated a validated candidate.
         if isinstance(raw, schemas.MinutesCreate):
@@ -80,6 +88,16 @@ def generate_minutes(db, meeting_id, owner_id, adapter: ReasoningProvider, reque
                                   "review_flags": [{"code": "INSUFFICIENT_EVIDENCE", "entity": "candidate",
                                                     "explanation": "Malformed structured output or empty evidence for a material claim.",
                                                     "evidence_segment_ids": [], "requires_human_review": True, "severity": "error"}]}) from None
-    # Provider output is never authoritative: the same deterministic validation,
-    # storage and history path is used for all current/future providers.
-    return meeting_service.save_minutes(db, meeting_id, owner_id, candidate, source=adapter.name)
+    current_meeting = meeting_service.owned_meeting(db, meeting_id, owner_id, lock=True)
+    current = db.scalar(minutes_query)
+    current_version = (current.id, current.revision) if current else None
+    current_transcript = [schemas.SegmentOut.model_validate(s).model_dump(mode="json")
+                          for s in meeting_service.ordered_segments(db, meeting_id)]
+    if (current_version != draft_version or current_transcript != transcript
+            or schemas.MeetingOut.model_validate(current_meeting) != meeting_snapshot):
+        raise HTTPException(409, "The meeting changed during generation. Reload it and try again.")
+    candidate.expected_revision = draft_version[1] if draft_version else None
+    return meeting_service.save_minutes(
+        db, meeting_id, owner_id, candidate, source=adapter.name,
+        source_model=adapter.model if isinstance(adapter, GroqReasoningAdapter) else None,
+    )

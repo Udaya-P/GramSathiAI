@@ -24,7 +24,7 @@ load_dotenv(BACKEND / ".env")
 
 
 @pytest.fixture(scope="session")
-def api():
+def api(tmp_path_factory):
     test_url = os.getenv("TEST_DATABASE_URL")
     if not test_url:
         pytest.fail("TEST_DATABASE_URL is required; use a dedicated PostgreSQL test database")
@@ -38,8 +38,11 @@ def api():
         pytest.fail("Test database name must differ from the application database name")
     if not app_url:
         pytest.fail("DATABASE_URL is required for the test database isolation safety check")
-    original_env = {key: os.environ.get(key) for key in ("DATABASE_URL", "JWT_SECRET", "CORS_ORIGINS", "APP_ENVIRONMENT", "ENABLE_MOCK_REASONING")}
-    os.environ.update(DATABASE_URL=test_url, JWT_SECRET=secrets.token_urlsafe(48), CORS_ORIGINS="[]", APP_ENVIRONMENT="test", ENABLE_MOCK_REASONING="true")
+    original_env = {key: os.environ.get(key) for key in ("DATABASE_URL", "JWT_SECRET", "CORS_ORIGINS",
+                    "APP_ENVIRONMENT", "ENABLE_MOCK_REASONING", "AUDIO_STORAGE_DIR")}
+    os.environ.update(DATABASE_URL=test_url, JWT_SECRET=secrets.token_urlsafe(48), CORS_ORIGINS="[]",
+                      APP_ENVIRONMENT="test", ENABLE_MOCK_REASONING="true",
+                      AUDIO_STORAGE_DIR=str(tmp_path_factory.mktemp("recordings")))
     from app.config import get_settings
     get_settings.cache_clear()
     from app.database import get_db, engine as app_engine
@@ -321,6 +324,74 @@ def test_upload_validation_ownership_and_concurrent_dedup(api):
     assert api.get(path + "/transcriptions", headers=other).status_code == 404
 
 
+def test_private_original_playback_ranges_and_legacy_restore(api):
+    from app.config import get_settings
+    from app.models import TranscriptionJob
+
+    owner, _, _ = account(api)
+    other, _, _ = account(api)
+    path = meeting(api, owner)
+    audio = (BACKEND.parent / "sample_audio" / "meeting_01_en_te.m4a").read_bytes()
+    queued = queue_upload(api, owner, path, audio)
+    assert queued.status_code == 202
+    job_id = queued.json()["id"]
+    status_path = f"{path}/transcriptions/{job_id}"
+    audio_path = status_path + "/audio"
+
+    assert api.get(audio_path).status_code == 401
+    assert api.get(audio_path, headers={**other, "Range": "bytes=2-6"}).status_code == 404
+    wrong_meeting = meeting(api, owner)
+    assert api.get(f"{wrong_meeting}/transcriptions/{job_id}/audio", headers=owner).status_code == 404
+    full = api.get(audio_path, headers=owner)
+    assert full.status_code == 200 and full.content == audio
+    assert full.headers["Content-Type"] == "audio/mp4"
+    assert full.headers["Accept-Ranges"] == "bytes"
+    assert full.headers["Cache-Control"] == "private, no-store"
+    partial = api.get(audio_path, headers={**owner, "Range": "bytes=2-6"})
+    assert partial.status_code == 206 and partial.content == audio[2:7]
+    assert partial.headers["Content-Range"] == f"bytes 2-6/{len(audio)}"
+    assert api.get(audio_path, headers={**owner, "Range": "bytes=-5"}).content == audio[-5:]
+    assert api.get(audio_path, headers={**owner, "Range": f"bytes={len(audio)}-"}).status_code == 416
+
+    client, remote, _ = fake_provider(job_id)
+    assert worker_tick(api, client, job_id)
+    assert worker_tick(api, client, job_id)
+    remote.status = "COMPLETED"
+    assert worker_tick(api, client, job_id)
+    with api.app.state.test_session_factory() as db:
+        assert db.get(TranscriptionJob, UUID(job_id)).audio_data is None
+    assert api.get(status_path, headers=owner).json()["status"] == "completed"
+    segments = api.get(path + "/transcript", headers=owner).json()
+    assert segments and all(s["transcription_job_id"] == job_id for s in segments)
+    assert api.get(audio_path, headers=owner).content == audio
+
+    # Simulate a job completed before originals were retained.
+    recording = get_settings().audio_storage_dir / path.rsplit("/", 1)[1] / f"{job_id}.m4a"
+    recording.unlink()
+    assert api.get(audio_path, headers=owner).status_code == 404
+    restored = queue_upload(api, owner, path, audio)
+    assert restored.status_code == 200 and restored.json()["id"] == job_id
+    assert restored.json()["status"] == "completed"
+    assert api.get(audio_path, headers=owner).content == audio
+    assert api.get(path + "/transcript", headers=owner).json() == segments
+    assert len(api.get(path + "/transcriptions", headers=owner).json()) == 1
+    assert client.create_job.call_count == 1
+
+
+def test_unavailable_recording_storage_does_not_queue_upload(api, monkeypatch, tmp_path):
+    from app.config import get_settings
+
+    owner, _, _ = account(api)
+    path = meeting(api, owner)
+    blocked = tmp_path / "not-a-directory"
+    blocked.touch()
+    monkeypatch.setattr(get_settings(), "audio_storage_dir", blocked)
+    result = queue_upload(api, owner, path)
+    assert result.status_code == 503
+    assert str(blocked) not in result.text
+    assert api.get(path + "/transcriptions", headers=owner).json() == []
+
+
 def test_worker_sdk_options_restart_and_atomic_import(api):
     from unittest.mock import Mock
     from gnani.stt import GnaniSTTBatchClient
@@ -438,25 +509,25 @@ def test_evon_disabled_mock_citations_and_human_review(api):
     path = meeting(api, owner)
     sid = api.post(path + "/transcript", headers=owner, json={"segments": [segment()]}).json()[0]["id"]
     assert api.post(path + "/minutes/generate", headers=other).status_code == 404
-    assert api.post(path + "/minutes/generate", headers=owner).status_code == 501
+    assert api.post(path + "/minutes/generate", headers=owner, json={"provider": "evon"}).status_code == 501
     try:
         api.app.dependency_overrides[get_evon_adapter] = lambda: MockEvonAdapter(minutes(sid + 999999))
-        invalid = api.post(path + "/minutes/generate", headers=owner)
+        invalid = api.post(path + "/minutes/generate", headers=owner, json={"provider": "evon"})
         assert invalid.status_code == 422 and invalid.json()["detail"]["code"] == "unsupported_claims"
         assert api.get(path + "/minutes", headers=owner).status_code == 404
         fixture = minutes(sid)
         fixture["decisions"][0]["evidence_segment_ids"] = []
         api.app.dependency_overrides[get_evon_adapter] = lambda: MockEvonAdapter(fixture)
-        assert api.post(path + "/minutes/generate", headers=owner).status_code == 422
+        assert api.post(path + "/minutes/generate", headers=owner, json={"provider": "evon"}).status_code == 422
         api.app.dependency_overrides[get_evon_adapter] = lambda: MockEvonAdapter(minutes(sid))
-        result = api.post(path + "/minutes/generate", headers=owner)
+        result = api.post(path + "/minutes/generate", headers=owner, json={"provider": "evon"})
         assert result.status_code == 200, result.text
         draft = result.json()
         assert draft["status"] == "draft" and draft["generation_source"] == "mock_fixture"
         assert any(f["code"] == "CLAIM_SUPPORT_UNVERIFIED" for f in draft["review_flags"])
         verified = api.post(path + "/minutes/verify", headers=owner, json={"confirmed": True, "verifier_name": "Secretary", "acknowledge_warnings": True})
         assert verified.json()["status"] == "verified" and all(f["acknowledged"] for f in verified.json()["review_flags"])
-        assert api.post(path + "/minutes/generate", headers=owner).status_code == 409
+        assert api.post(path + "/minutes/generate", headers=owner, json={"provider": "evon"}).status_code == 409
     finally:
         api.app.dependency_overrides.pop(get_evon_adapter, None)
 
@@ -679,7 +750,8 @@ def test_phase3_mock_gate_and_live_evon_stays_disabled(api, monkeypatch):
     from app.config import get_settings
     owner, _, _ = account(api)
     path, _, fixture = phase3_fixture(api, owner)
-    assert api.post(path + "/minutes/generate", headers=owner).status_code == 501
+    monkeypatch.setattr(get_settings(), "groq_api_key", None)
+    assert api.post(path + "/minutes/generate", headers=owner).status_code == 503
     assert api.post(path + "/minutes/generate", headers=owner, json={"provider": "evon"}).status_code == 501
     monkeypatch.setattr(get_settings(), "app_environment", "production")
     assert generate_fixture(api, owner, path, fixture).status_code == 403
@@ -739,3 +811,95 @@ def test_phase3_migration_preserves_legacy_transcripts_and_verified_minutes(api)
         assert tuple(preserved) == ("verified", "Secretary", "accepted")
         assert conn.scalar(text("SELECT classification FROM decisions WHERE minutes_id=21")) == "approved"
         conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+
+def test_groq_generation_validates_output_and_rejects_stale_transcript(api, monkeypatch):
+    import groq
+    import httpx
+    from pydantic import SecretStr
+    from sqlalchemy import select
+
+    from app import models, schemas
+    from app.config import get_settings
+    from app.services import groq_reasoning, meeting_service
+
+    owner, _, user = account(api)
+    path, segments, fixture = phase3_fixture(api, owner)
+    meeting_id = UUID(path.rsplit("/", 1)[-1])
+    monkeypatch.setattr(get_settings(), "groq_api_key", SecretStr("test-key"))
+    mode = "invalid"
+
+    def respond(request):
+        payload = json.loads(request.content)
+        assert payload["response_format"] == {"type": "json_object"}
+        sent = json.loads(payload["messages"][1]["content"].split("\n", 1)[1])
+        assert sent == segments
+        if mode == "stale":
+            with api.app.state.test_session_factory.begin() as db:
+                # This lock can only be acquired if generation released its snapshot transaction.
+                db.scalar(select(models.Meeting).where(models.Meeting.id == meeting_id).with_for_update(nowait=True))
+                meeting_service.append_transcript(db, meeting_id, UUID(user["id"]), schemas.TranscriptCreate(
+                    segments=[segment("A new discussion was appended.", start=40, end=44)]))
+        return httpx.Response(200, json={
+            "id": "test-completion", "object": "chat.completion", "created": 0,
+            "model": "llama-3.3-70b-versatile",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "invalid JSON" if mode == "invalid" else json.dumps(fixture),
+            }}],
+        })
+
+    def mocked_client(**kwargs):
+        assert kwargs["max_retries"] == 1
+        return groq.Groq(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+
+    monkeypatch.setattr(groq_reasoning, "Groq", mocked_client)
+    route = path + "/minutes/generate"
+    assert api.post(route, headers=owner).status_code == 502
+    assert api.get(path + "/minutes", headers=owner).status_code == 404
+    mode = "valid"
+    response = api.post(route, headers=owner, json={"provider": "groq"})
+    assert response.status_code == 200, response.text
+    original = response.json()
+    assert original["generation_source"] == "groq"
+    assert original["generation_model"] == "llama-3.3-70b-versatile"
+    assert original["status"] == "draft" and original["review_flags"]
+    mode = "stale"
+    assert api.post(route, headers=owner).status_code == 409
+    persisted = api.get(path + "/minutes", headers=owner).json()
+    assert persisted["revision"] == original["revision"]
+    assert persisted["summary"] == original["summary"]
+
+
+def test_verified_minutes_pdf_is_owner_only_and_embeds_multilingual_fonts(api):
+    owner, _, _ = account(api)
+    other, _, _ = account(api)
+    path = meeting(api, owner)
+    route = path + "/minutes/pdf"
+    assert api.get(route).status_code == 401
+    assert api.get(route, headers=owner).status_code == 404
+    original_text = "Pipeline repair. గ్రామ సభలో చర్చ. ग्राम सभा में चर्चा। ಗ್ರಾಮ ಸಭೆಯಲ್ಲಿ ಚರ್ಚೆ."
+    transcript = api.post(path + "/transcript", headers=owner, json={
+        "segments": [segment(original_text, language="mixed")],
+    }).json()
+    segment_id = transcript[0]["id"]
+    fixture = minutes(segment_id)
+    fixture["decisions"][0].update(
+        proposed_amount=15000, approved_amount=15000, currency="INR",
+        evidence_quotes=[{"segment_id": segment_id, "quote": original_text}],
+    )
+    assert generate_fixture(api, owner, path, fixture).status_code == 200
+    assert api.get(route, headers=owner).status_code == 409
+    assert api.get(route, headers=other).status_code == 404
+    verified = api.post(path + "/minutes/verify", headers=owner, json={
+        "verifier_name": "Secretary", "confirmed": True, "acknowledge_warnings": True,
+    })
+    assert verified.status_code == 200, verified.text
+    assert api.get(route, headers=other).status_code == 404
+    report = api.get(route, headers=owner)
+    assert report.status_code == 200, report.text
+    assert report.headers["content-type"] == "application/pdf"
+    assert report.headers["content-disposition"] == f'attachment; filename="gramsathi-minutes-{path.rsplit("/", 1)[-1]}.pdf"'
+    assert report.headers["cache-control"] == "private, no-store"
+    assert report.content.startswith(b"%PDF-")
+    assert report.content.count(b"/FontFile2") == 4
+    assert report.content.count(b"/ToUnicode") == 4

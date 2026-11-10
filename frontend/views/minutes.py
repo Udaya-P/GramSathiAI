@@ -1,4 +1,4 @@
-from datetime import date
+import json
 
 import pandas as pd
 import streamlit as st
@@ -24,6 +24,7 @@ def render():
     if status != "verified":
         if bar[1].button("Edit minutes" if minutes else "Write minutes", width="stretch", icon=":material/edit:",
                          disabled=not ctx["segments"]):
+            st.session_state.minutes_edit_revision = minutes.get("revision") if minutes else None
             st.session_state.edit_minutes = True
             st.rerun()
         if not minutes and bar[2].button("Draft with AI", width="stretch", icon=":material/auto_awesome:",
@@ -37,17 +38,14 @@ def render():
         return
 
     if not minutes:
-        c.empty_state("No minutes yet", "Write the minutes yourself, or draft them with AI when that is available.")
+        c.empty_state("No minutes yet", "Write the minutes yourself or generate an evidence-linked draft with Groq.")
         return
 
-    if minutes.get("review_flags"):
-        c.callout(f"{len(minutes['review_flags'])} item(s) were drafted by AI. Check each one against the "
-                  "transcript before verifying.", "warn", "Review needed")
     if status == "verified":
         c.callout(f"Verified by {minutes['verifier_name']} on {ui.fmt_datetime(minutes['verified_at'])}.", "ok",
                   "These minutes are verified and can no longer be edited")
 
-    c.minutes_document(minutes, ctx["by_id"])
+    c.minutes_document(minutes, ctx["by_id"], playback=ctx)
     c.voice_player(minutes)
     if status == "draft":
         st.divider()
@@ -57,13 +55,10 @@ def render():
 
 def _generate(ctx):
     try:
-        with st.spinner("Drafting minutes…"):
+        with st.spinner("Drafting minutes with Groq…"):
             api.generate_minutes(ctx["token"], ctx["meeting"]["id"])
     except api.ApiError as exc:
-        if exc.status == 501:
-            st.warning("Drafting with AI is not available yet. Please write the minutes yourself.")
-        else:
-            ui.handle_error(exc)
+        ui.handle_error(exc)
     else:
         ui.invalidate()
         ui.flash("Draft minutes created. Please review every item.")
@@ -71,78 +66,102 @@ def _generate(ctx):
 
 
 # --- editing ---------------------------------------------------------------
-def _parse_ids(raw, valid):
+def _text(value):
+    return "" if pd.isna(value) else str(value)
+
+
+def _format_ids(ids):
+    return ", ".join(map(str, ids))
+
+
+def _parse_ids(raw, valid, *, required=True):
     try:
-        ids = [int(p) for p in str(raw or "").replace(";", ",").split(",") if p.strip()]
+        ids = [int(part) for part in _text(raw).replace(";", ",").split(",") if part.strip()]
     except ValueError:
-        return None, "Evidence must be segment numbers separated by commas, such as 4, 6."
-    if not ids:
-        return None, "Each row needs at least one evidence segment number."
-    bad = [i for i in ids if i not in valid]
-    if bad:
-        return None, f"These segment numbers are not in the transcript: {', '.join(map(str, bad))}."
-    return ids, None
+        raise ValueError("Enter evidence segment numbers separated by commas.") from None
+    if required and not ids:
+        raise ValueError("Each row needs at least one evidence segment number.")
+    if set(ids) - valid:
+        raise ValueError("Evidence must refer to segments in this meeting.")
+    return ids
 
 
-def _rows(items, cols, date_cols=()):
-    """Editor table with explicit dtypes, so empty tables are still editable as text/date columns."""
-    df = pd.DataFrame(items, columns=cols) if items else pd.DataFrame({k: pd.Series([], dtype="object") for k in cols})
-    for k in cols:
-        df[k] = pd.to_datetime(df[k]) if k in date_cols else df[k].astype("object")
-    return df
+def _json_list(raw, label):
+    try:
+        value = json.loads(_text(raw).strip() or "[]")
+    except ValueError:
+        raise ValueError(f"{label} must contain a valid JSON array.") from None
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"{label} must be a JSON array of objects.")
+    return value
+
+
+def _edit_table(items, columns, config, key, *, dates=()):
+    rows = [{**item, "evidence_segment_ids": _format_ids(item["evidence_segment_ids"]),
+             "evidence_quotes": json.dumps(item.get("evidence_quotes", []), ensure_ascii=False)} for item in items]
+    data = pd.DataFrame(rows, columns=columns, dtype=object)
+    for field in dates:
+        data[field] = pd.to_datetime(data[field])
+    return st.data_editor(
+        data, num_rows="dynamic", width="stretch", hide_index=True, key=key,
+        column_config={**config, "evidence_segment_ids": st.column_config.TextColumn("Evidence segment IDs"),
+                       "evidence_quotes": st.column_config.TextColumn("Evidence quotes (JSON)")},
+    )
 
 
 def _editor(ctx):
     token, meeting, minutes = ctx["token"], ctx["meeting"], ctx["minutes"]
+    revision = minutes.get("revision") if minutes else None
+    if revision != st.session_state.get("minutes_edit_revision"):
+        st.warning("The draft changed while you were editing. Reopen it to load the latest revision.")
+        if st.button("Return to minutes"):
+            st.session_state.edit_minutes = False
+            st.rerun()
+        return
+    draft = minutes or {}
+    key = f"{meeting['id']}_{revision}"
     valid = set(ctx["by_id"])
     st.markdown("### Edit minutes")
-    c.callout("Evidence is the transcript segment number (like 8 or 10) shown on the Audio & Transcripts page. "
-              "Use commas for several, such as 8, 10. Add a row with the + at the bottom of each table.",
-              "info", "How to fill this in")
-    summary = st.text_area("Meeting summary", value=minutes["summary"] if minutes else "", height=120,
-                           placeholder="A short summary of what was discussed.")
-
-    dec = [{"description": d["description"], "status": d["status"],
-            "evidence": ", ".join(map(str, d["evidence_segment_ids"]))} for d in (minutes or {}).get("decisions", [])]
-    act = [{"task": a["task"], "assigned_to": a["assigned_to"],
-            "deadline": date.fromisoformat(a["deadline"]) if a["deadline"] else None,
-            "evidence": ", ".join(map(str, a["evidence_segment_ids"]))} for a in (minutes or {}).get("action_items", [])]
-    iss = [{"description": u["description"], "evidence": ", ".join(map(str, u["evidence_segment_ids"]))}
-           for u in (minutes or {}).get("unresolved_issues", [])]
+    st.caption("Use transcript segment numbers for evidence. Separate multiple IDs with commas. Add rows with the + at the bottom of each table.")
+    summary = st.text_area("Meeting summary", value=draft.get("summary", ""), height=120, key=f"summary_{key}")
+    summary_ids = st.text_input("Summary evidence segment IDs", value=_format_ids(draft.get("summary_evidence_segment_ids", [])),
+                                key=f"summary_ids_{key}")
+    with st.expander("Summary claims and quotes"):
+        summary_claims = st.text_area("Summary claims (JSON)", value=json.dumps(draft.get("summary_claims", []), ensure_ascii=False, indent=2),
+                                      key=f"summary_claims_{key}")
 
     st.markdown("**Decisions**")
-    st.caption("A Suggestion was only proposed. Choose Approved resolution only if the meeting agreed.")
-    dec_df = st.data_editor(_rows(dec, ["description", "status", "evidence"]), num_rows="dynamic", width="stretch",
-                            key="m_dec", column_config={
-                                "description": st.column_config.TextColumn("Decision", width="medium"),
-                                "status": st.column_config.SelectboxColumn(
-                                    "Status", options=["proposed", "approved", "rejected"], required=True,
-                                    help="proposed = suggestion, approved = agreed, rejected = turned down"),
-                                "evidence": st.column_config.TextColumn("Evidence segments")})
+    decisions = [{**item, "status": item.get("classification") or item["status"]} for item in draft.get("decisions", [])]
+    decision_rows = _edit_table(decisions,
+        ["description", "status", "estimated_amount", "proposed_amount", "approved_amount", "currency", "evidence_segment_ids", "evidence_quotes"],
+        {"description": st.column_config.TextColumn("Decision", width="medium"),
+         "status": st.column_config.SelectboxColumn("Status", options=list(c.DECISION), required=True, default="proposed"),
+         "estimated_amount": st.column_config.TextColumn("Estimated amount"),
+         "proposed_amount": st.column_config.TextColumn("Proposed amount"),
+         "approved_amount": st.column_config.TextColumn("Approved amount"),
+         "currency": st.column_config.SelectboxColumn("Currency", options=["INR", "USD", "EUR"])}, f"decisions_{key}")
     st.markdown("**Action items**")
-    act_df = st.data_editor(_rows(act, ["task", "assigned_to", "deadline", "evidence"], date_cols=("deadline",)),
-                            num_rows="dynamic", width="stretch", key="m_act", column_config={
-                                "task": st.column_config.TextColumn("Task", width="medium"),
-                                "assigned_to": st.column_config.TextColumn("Responsible person"),
-                                "deadline": st.column_config.DateColumn("Deadline"),
-                                "evidence": st.column_config.TextColumn("Evidence segments")})
+    action_rows = _edit_table(draft.get("action_items", []),
+        ["task", "assigned_to", "deadline", "deadline_text", "evidence_segment_ids", "evidence_quotes"],
+        {"task": st.column_config.TextColumn("Task", width="medium"),
+         "assigned_to": st.column_config.TextColumn("Responsible person"),
+         "deadline": st.column_config.DateColumn("Calendar deadline"),
+         "deadline_text": st.column_config.TextColumn("Relative deadline")}, f"actions_{key}", dates=("deadline",))
     st.markdown("**Unresolved issues**")
-    iss_df = st.data_editor(_rows(iss, ["description", "evidence"]), num_rows="dynamic", width="stretch",
-                            key="m_iss", column_config={
-                                "description": st.column_config.TextColumn("Issue", width="medium"),
-                                "evidence": st.column_config.TextColumn("Evidence segments")})
+    issue_rows = _edit_table(draft.get("unresolved_issues", []), ["description", "evidence_segment_ids", "evidence_quotes"],
+                            {"description": st.column_config.TextColumn("Issue", width="medium")}, f"issues_{key}")
 
     save, cancel, _ = st.columns([1.4, 1, 2.6])
     if cancel.button("Cancel", width="stretch"):
         st.session_state.edit_minutes = False
         st.rerun()
     if save.button("Save minutes", type="primary", width="stretch", icon=":material/save:"):
-        payload, error = _build_payload(summary, dec_df, act_df, iss_df, valid)
-        if error:
-            st.error(error)
-            return
         try:
+            payload = _build_payload(summary, summary_ids, summary_claims, decision_rows, action_rows, issue_rows, valid, revision)
             api.save_minutes(token, meeting["id"], payload)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
         except api.ApiError as exc:
             ui.handle_error(exc)
             return
@@ -152,34 +171,21 @@ def _editor(ctx):
         st.rerun()
 
 
-def _build_payload(summary, dec_df, act_df, iss_df, valid):
+def _build_payload(summary, summary_ids, summary_claims, decisions, actions, issues, valid, revision):
     if not summary.strip():
-        return None, "Write a summary first."
-    payload = {"summary": summary, "decisions": [], "action_items": [], "unresolved_issues": []}
-    for _, r in dec_df.iterrows():
-        if not str(r["description"] or "").strip():
-            return None, "Each decision needs a description."
-        ids, err = _parse_ids(r["evidence"], valid)
-        if err:
-            return None, f"Decision: {err}"
-        payload["decisions"].append({"description": r["description"], "status": r["status"],
-                                     "evidence_segment_ids": ids})
-    for _, r in act_df.iterrows():
-        if not str(r["task"] or "").strip() or not str(r["assigned_to"] or "").strip():
-            return None, "Each action item needs a task and a responsible person."
-        ids, err = _parse_ids(r["evidence"], valid)
-        if err:
-            return None, f"Action item: {err}"
-        deadline = r["deadline"]
-        payload["action_items"].append({
-            "task": r["task"], "assigned_to": r["assigned_to"],
-            "deadline": None if pd.isna(deadline) else pd.Timestamp(deadline).date().isoformat(),
-            "evidence_segment_ids": ids})
-    for _, r in iss_df.iterrows():
-        if not str(r["description"] or "").strip():
-            return None, "Each unresolved issue needs a description."
-        ids, err = _parse_ids(r["evidence"], valid)
-        if err:
-            return None, f"Issue: {err}"
-        payload["unresolved_issues"].append({"description": r["description"], "evidence_segment_ids": ids})
-    return payload, None
+        raise ValueError("Write a summary first.")
+    payload = {"summary": summary, "summary_evidence_segment_ids": _parse_ids(summary_ids, valid, required=False),
+               "summary_claims": _json_list(summary_claims, "Summary claims"), "expected_revision": revision}
+    for key, table, title_field in (("decisions", decisions, "description"), ("action_items", actions, "task"),
+                                    ("unresolved_issues", issues, "description")):
+        payload[key] = []
+        for _, row in table.iterrows():
+            if not _text(row[title_field]).strip():
+                raise ValueError("Every decision, action item, and issue needs a description.")
+            item = {field: _text(value) or None for field, value in row.items()}
+            item["evidence_segment_ids"] = _parse_ids(row["evidence_segment_ids"], valid)
+            item["evidence_quotes"] = _json_list(row["evidence_quotes"], "Evidence quotes")
+            if key == "action_items":
+                item["deadline"] = None if pd.isna(row["deadline"]) else pd.Timestamp(row["deadline"]).date().isoformat()
+            payload[key].append(item)
+    return payload
