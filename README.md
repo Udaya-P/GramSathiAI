@@ -88,6 +88,8 @@ GramSathiAI/
 │   │   ├── schemas.py
 │   │   └── main.py
 │   ├── alembic/
+│   ├── data/
+│   │   └── sample_meeting.json
 │   ├── tests/
 │   └── requirements.txt
 ├── frontend/
@@ -95,7 +97,6 @@ GramSathiAI/
 │   ├── components.py
 │   ├── styles.py
 │   └── requirements.txt
-├── sample_audio/
 └── README.md
 ```
 
